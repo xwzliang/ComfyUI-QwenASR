@@ -36,11 +36,36 @@ folder_paths.add_model_folder_path("Qwen3-ASR", QWEN3_ASR_ROOT)
 
 SUPPORTED_LANGUAGES = [
     "auto",
-    "Chinese", "English", "Cantonese", "Arabic", "German", "French", "Spanish",
-    "Portuguese", "Indonesian", "Italian", "Korean", "Russian", "Thai",
-    "Vietnamese", "Japanese", "Turkish", "Hindi", "Malay", "Dutch", "Swedish",
-    "Danish", "Finnish", "Polish", "Czech", "Filipino", "Persian", "Greek",
-    "Hungarian", "Macedonian", "Romanian",
+    "Chinese",
+    "English",
+    "Cantonese",
+    "Arabic",
+    "German",
+    "French",
+    "Spanish",
+    "Portuguese",
+    "Indonesian",
+    "Italian",
+    "Korean",
+    "Russian",
+    "Thai",
+    "Vietnamese",
+    "Japanese",
+    "Turkish",
+    "Hindi",
+    "Malay",
+    "Dutch",
+    "Swedish",
+    "Danish",
+    "Finnish",
+    "Polish",
+    "Czech",
+    "Filipino",
+    "Persian",
+    "Greek",
+    "Hungarian",
+    "Macedonian",
+    "Romanian",
 ]
 
 _ASR_MODEL_CACHE = {}
@@ -122,6 +147,8 @@ def _get_defaults():
     if isinstance(defaults, dict) and defaults:
         return defaults
     return _default_config()["defaults"]
+
+
 _EXTRA_MODEL_PATHS = None
 
 
@@ -203,6 +230,7 @@ def _load_extra_model_paths():
             continue
         try:
             import yaml
+
             data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         except Exception as e:
             print(f"[Qwen3ASR] Failed to read {path}: {e}")
@@ -219,7 +247,11 @@ def _load_extra_model_paths():
 
 
 def _find_local_model(repo_id: str) -> Optional[str]:
-    model_name = _get_model_ids().get(repo_id) or _get_aligner_ids().get(repo_id) or repo_id.split("/")[-1]
+    model_name = (
+        _get_model_ids().get(repo_id)
+        or _get_aligner_ids().get(repo_id)
+        or repo_id.split("/")[-1]
+    )
     candidates = []
 
     default_root = _model_storage_path(repo_id)
@@ -245,7 +277,11 @@ def _find_local_model(repo_id: str) -> Optional[str]:
 
 
 def _model_storage_path(repo_id: str) -> str:
-    name = _get_model_ids().get(repo_id) or _get_aligner_ids().get(repo_id) or repo_id.replace("/", "_")
+    name = (
+        _get_model_ids().get(repo_id)
+        or _get_aligner_ids().get(repo_id)
+        or repo_id.replace("/", "_")
+    )
     return os.path.join(QWEN3_ASR_ROOT, name)
 
 
@@ -290,7 +326,9 @@ def _download_to_local(repo_id: str, source: str, target_dir: str) -> str:
         try:
             from huggingface_hub import snapshot_download
         except Exception as e:
-            raise RuntimeError("huggingface_hub is required for HuggingFace downloads") from e
+            raise RuntimeError(
+                "huggingface_hub is required for HuggingFace downloads"
+            ) from e
         snapshot_download(repo_id, local_dir=target_dir)
 
     return target_dir
@@ -368,7 +406,15 @@ def _load_cached_model(
     max_inference_batch_size: int = 32,
     max_new_tokens: int = 256,
 ):
-    key = _cache_key(model_path, dtype, device, attention, forced_aligner_path, max_inference_batch_size, max_new_tokens)
+    key = _cache_key(
+        model_path,
+        dtype,
+        device,
+        attention,
+        forced_aligner_path,
+        max_inference_batch_size,
+        max_new_tokens,
+    )
     cached = _ASR_MODEL_CACHE.get(key)
     if cached is not None:
         return cached
@@ -412,7 +458,9 @@ def _build_srt(time_stamps) -> str:
     lines = []
     for idx, item in enumerate(time_stamps, start=1):
         lines.append(str(idx))
-        lines.append(f"{_format_srt_time(item.start_time)} --> {_format_srt_time(item.end_time)}")
+        lines.append(
+            f"{_format_srt_time(item.start_time)} --> {_format_srt_time(item.end_time)}"
+        )
         lines.append(item.text or "")
         lines.append("")
     return "\n".join(lines).strip()
@@ -430,12 +478,66 @@ def _join_tokens(a: str, b: str) -> str:
     return f"{a} {b}"
 
 
-def _group_time_stamps(time_stamps, max_gap_sec: float, max_chars: int, split_mode: str):
+class _AlignedStamp:
+    """Mock object to hold aligned text and timestamps safely."""
+
+    def __init__(self, start_time, end_time, text):
+        self.start_time = start_time
+        self.end_time = end_time
+        self.text = text
+
+
+def _align_punctuation_to_stamps(full_text: str, time_stamps: list) -> list:
+    """Matches raw unpunctuated timestamps to the punctuated master text."""
+    if not time_stamps or not full_text:
+        return time_stamps
+
+    punct_chars = set("，。！？.,!?")
+    aligned = []
+    cursor = 0
+
+    for i, stamp in enumerate(time_stamps):
+        word = (stamp.text or "").strip()
+        start_time = stamp.start_time
+        end_time = stamp.end_time
+
+        if not word:
+            aligned.append(_AlignedStamp(start_time, end_time, word))
+            continue
+
+        word_idx = full_text.find(word, cursor)
+        if word_idx != -1:
+            cursor = word_idx + len(word)
+
+            # Find bounds for the gap between this word and the next
+            next_idx = len(full_text)
+            if i + 1 < len(time_stamps):
+                next_word = (time_stamps[i + 1].text or "").strip()
+                if next_word:
+                    temp_idx = full_text.find(next_word, cursor)
+                    if temp_idx != -1:
+                        next_idx = temp_idx
+
+            # Extract characters caught between words and snatch any punctuation
+            gap = full_text[cursor:next_idx]
+            puncts = "".join(c for c in gap if c in punct_chars)
+
+            aligned.append(_AlignedStamp(start_time, end_time, word + puncts))
+        else:
+            # Fallback if the token wasn't perfectly matched in the string search
+            aligned.append(_AlignedStamp(start_time, end_time, word))
+
+    return aligned
+
+
+def _group_time_stamps(
+    time_stamps, max_gap_sec: float, max_chars: int, split_mode: str
+):
     if not time_stamps:
         return []
     groups = []
     cur = None
-    punct = ("。", "！", "？", ".", "!", "?")
+    punct = ("，", "。", "！", "？", ",", ".", "!", "?")
     for item in time_stamps:
         text = (item.text or "").strip()
         if not text:
@@ -453,9 +555,22 @@ def _group_time_stamps(time_stamps, max_gap_sec: float, max_chars: int, split_mo
         too_long = max_chars > 0 and (len(cur["text"]) + len(text)) > max_chars
         end_sentence = any(cur["text"].endswith(p) for p in punct)
 
-        split_by_punct = split_mode in ("split_by_punctuation", "split_by_punctuation_or_length", "split_by_punctuation_or_pause", "split_by_punctuation_or_pause_or_length")
-        split_by_length = split_mode in ("split_by_length", "split_by_punctuation_or_length", "split_by_punctuation_or_pause_or_length")
-        split_by_pause = split_mode in ("split_by_pause", "split_by_punctuation_or_pause", "split_by_punctuation_or_pause_or_length")
+        split_by_punct = split_mode in (
+            "split_by_punctuation",
+            "split_by_punctuation_or_length",
+            "split_by_punctuation_or_pause",
+            "split_by_punctuation_or_pause_or_length",
+        )
+        split_by_length = split_mode in (
+            "split_by_length",
+            "split_by_punctuation_or_length",
+            "split_by_punctuation_or_pause_or_length",
+        )
+        split_by_pause = split_mode in (
+            "split_by_pause",
+            "split_by_punctuation_or_pause",
+            "split_by_punctuation_or_pause_or_length",
+        )
 
         should_split = False
         if split_by_punct and end_sentence:
@@ -478,6 +593,12 @@ def _group_time_stamps(time_stamps, max_gap_sec: float, max_chars: int, split_mo
 
     if cur is not None:
         groups.append(cur)
+
+    # Strip trailing punctuation and spaces from each finalized line
+    punct_to_remove = "".join(punct)
+    for g in groups:
+        g["text"] = g["text"].rstrip(punct_to_remove)
+
     return groups
 
 
@@ -520,11 +641,42 @@ class AILab_Qwen3ASR:
                 "audio": ("AUDIO", {"tooltip": "Audio input to transcribe."}),
             },
             "optional": {
-                "model": (list(_get_model_ids().keys()), {"default": defaults.get("repo_id", "Qwen/Qwen3-ASR-0.6B"), "tooltip": "Choose the ASR model size."}),
-                "precision": (["bf16", "fp16", "fp32"], {"default": defaults.get("precision", "bf16"), "tooltip": "Inference precision."}),
-                "language": (SUPPORTED_LANGUAGES, {"default": defaults.get("language", "auto"), "tooltip": "Force language or auto-detect."}),
-                "hints": ("STRING", {"default": "", "multiline": True, "tooltip": "Optional hints/keywords (names, terms) to improve recognition."}),
-                "unload_models": ("BOOLEAN", {"default": True, "tooltip": "Unload cached model after inference."}),
+                "model": (
+                    list(_get_model_ids().keys()),
+                    {
+                        "default": defaults.get("repo_id", "Qwen/Qwen3-ASR-0.6B"),
+                        "tooltip": "Choose the ASR model size.",
+                    },
+                ),
+                "precision": (
+                    ["bf16", "fp16", "fp32"],
+                    {
+                        "default": defaults.get("precision", "bf16"),
+                        "tooltip": "Inference precision.",
+                    },
+                ),
+                "language": (
+                    SUPPORTED_LANGUAGES,
+                    {
+                        "default": defaults.get("language", "auto"),
+                        "tooltip": "Force language or auto-detect.",
+                    },
+                ),
+                "hints": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "tooltip": "Optional hints/keywords (names, terms) to improve recognition.",
+                    },
+                ),
+                "unload_models": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Unload cached model after inference.",
+                    },
+                ),
             },
         }
 
@@ -588,20 +740,124 @@ class AILab_Qwen3ASRSubtitle:
                 "audio": ("AUDIO", {"tooltip": "Audio input to transcribe."}),
             },
             "optional": {
-                "model": (list(_get_model_ids().keys()), {"default": defaults.get("repo_id", "Qwen/Qwen3-ASR-0.6B"), "tooltip": "Choose the ASR model size."}),
-                "precision": (["bf16", "fp16", "fp32"], {"default": defaults.get("precision", "bf16"), "tooltip": "Inference precision."}),
-                "attention": (["auto", "flash_attention_2", "sdpa", "eager"], {"default": defaults.get("attention", "auto"), "tooltip": "Attention backend override."}),
-                "forced_aligner": (list(_get_aligner_ids().keys()), {"default": defaults.get("forced_aligner", "Qwen/Qwen3-ForcedAligner-0.6B"), "tooltip": "Forced aligner for timestamped subtitles."}),
-                "language": (SUPPORTED_LANGUAGES, {"default": defaults.get("language", "auto"), "tooltip": "Force language or auto-detect."}),
-                "hints": ("STRING", {"default": "", "multiline": True, "tooltip": "Optional hints/keywords (names, terms) to improve recognition."}),
-                "output_format": (["none", "txt", "srt"], {"default": "none", "tooltip": "File save format only (does not change subtitle output)."}),
-                "output_path": ("STRING", {"default": "", "multiline": False, "tooltip": "Optional output file path (relative goes to ComfyUI output)."}),
-                "split_mode": (["split_by_punctuation_or_pause_or_length", "split_by_punctuation_or_pause", "split_by_punctuation_or_length", "split_by_punctuation", "split_by_pause", "split_by_length"], {"default": "split_by_punctuation_or_pause_or_length", "tooltip": "Sentence splitting strategy."}),
-                "max_gap_sec": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 8.0, "step": 0.1, "tooltip": "Max silence gap to keep the same sentence."}),
-                "max_chars": ("INT", {"default": 40, "min": 0, "max": 200, "tooltip": "Optional max characters per line (0 = no limit)."}),
-                "max_inference_batch_size": ("INT", {"default": 32, "min": 1, "max": 256, "tooltip": "Batch size for inference/alignment to avoid OOM."}),
-                "max_new_tokens": ("INT", {"default": 256, "min": 1, "max": 2048, "tooltip": "Max new tokens per chunk."}),
-                "unload_models": ("BOOLEAN", {"default": True, "tooltip": "Unload cached model after inference."}),
+                "model": (
+                    list(_get_model_ids().keys()),
+                    {
+                        "default": defaults.get("repo_id", "Qwen/Qwen3-ASR-0.6B"),
+                        "tooltip": "Choose the ASR model size.",
+                    },
+                ),
+                "precision": (
+                    ["bf16", "fp16", "fp32"],
+                    {
+                        "default": defaults.get("precision", "bf16"),
+                        "tooltip": "Inference precision.",
+                    },
+                ),
+                "attention": (
+                    ["auto", "flash_attention_2", "sdpa", "eager"],
+                    {
+                        "default": defaults.get("attention", "auto"),
+                        "tooltip": "Attention backend override.",
+                    },
+                ),
+                "forced_aligner": (
+                    list(_get_aligner_ids().keys()),
+                    {
+                        "default": defaults.get(
+                            "forced_aligner", "Qwen/Qwen3-ForcedAligner-0.6B"
+                        ),
+                        "tooltip": "Forced aligner for timestamped subtitles.",
+                    },
+                ),
+                "language": (
+                    SUPPORTED_LANGUAGES,
+                    {
+                        "default": defaults.get("language", "auto"),
+                        "tooltip": "Force language or auto-detect.",
+                    },
+                ),
+                "hints": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "tooltip": "Optional hints/keywords (names, terms) to improve recognition.",
+                    },
+                ),
+                "output_format": (
+                    ["none", "txt", "srt"],
+                    {
+                        "default": "none",
+                        "tooltip": "File save format only (does not change subtitle output).",
+                    },
+                ),
+                "output_path": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": "Optional output file path (relative goes to ComfyUI output).",
+                    },
+                ),
+                "split_mode": (
+                    [
+                        "split_by_punctuation_or_pause_or_length",
+                        "split_by_punctuation_or_pause",
+                        "split_by_punctuation_or_length",
+                        "split_by_punctuation",
+                        "split_by_pause",
+                        "split_by_length",
+                    ],
+                    {
+                        "default": "split_by_punctuation_or_pause_or_length",
+                        "tooltip": "Sentence splitting strategy.",
+                    },
+                ),
+                "max_gap_sec": (
+                    "FLOAT",
+                    {
+                        "default": 0.6,
+                        "min": 0.0,
+                        "max": 8.0,
+                        "step": 0.1,
+                        "tooltip": "Max silence gap to keep the same sentence.",
+                    },
+                ),
+                "max_chars": (
+                    "INT",
+                    {
+                        "default": 40,
+                        "min": 0,
+                        "max": 200,
+                        "tooltip": "Optional max characters per line (0 = no limit).",
+                    },
+                ),
+                "max_inference_batch_size": (
+                    "INT",
+                    {
+                        "default": 32,
+                        "min": 1,
+                        "max": 256,
+                        "tooltip": "Batch size for inference/alignment to avoid OOM.",
+                    },
+                ),
+                "max_new_tokens": (
+                    "INT",
+                    {
+                        "default": 256,
+                        "min": 1,
+                        "max": 2048,
+                        "tooltip": "Max new tokens per chunk.",
+                    },
+                ),
+                "unload_models": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Unload cached model after inference.",
+                    },
+                ),
             },
         }
 
@@ -670,7 +926,18 @@ class AILab_Qwen3ASRSubtitle:
         subtitles = ""
         file_path = ""
         time_stamps = getattr(result, "time_stamps", None)
-        groups = _group_time_stamps(time_stamps, max_gap_sec=max_gap_sec, max_chars=max_chars, split_mode=split_mode)
+
+        # APPLY PUNCTUATION ALIGNMENT HERE
+        if time_stamps and text:
+            time_stamps = _align_punctuation_to_stamps(text, time_stamps)
+
+        groups = _group_time_stamps(
+            time_stamps,
+            max_gap_sec=max_gap_sec,
+            max_chars=max_chars,
+            split_mode=split_mode,
+        )
+
         # Always build subtitle output
         lines = []
         for g in groups:
@@ -709,7 +976,7 @@ class AILab_Qwen3ASRSubtitle:
             except Exception:
                 pass
 
-        return (text, subtitles, detected_lang, file_path)
+        return (text, file_content, detected_lang, file_path)
 
 
 NODE_CLASS_MAPPINGS = {
