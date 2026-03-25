@@ -858,6 +858,16 @@ class AILab_Qwen3ASRSubtitle:
                         "tooltip": "Unload cached model after inference.",
                     },
                 ),
+                "minimum_duration": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 5.0,
+                        "step": 0.1,
+                        "tooltip": "Drop subtitle segments shorter than this duration (in seconds).",
+                    },
+                ),
             },
         }
 
@@ -883,6 +893,7 @@ class AILab_Qwen3ASRSubtitle:
         max_inference_batch_size=32,
         max_new_tokens=256,
         unload_models=True,
+        minimum_duration=0.0,
     ):
         if Qwen3ASRModel is None:
             raise RuntimeError(f"qwen-asr not available: {_IMPORT_ERROR}")
@@ -937,6 +948,10 @@ class AILab_Qwen3ASRSubtitle:
             max_chars=max_chars,
             split_mode=split_mode,
         )
+
+        # Filter out segments that are shorter than the minimum duration
+        if minimum_duration > 0:
+            groups = [g for g in groups if (g['end'] - g['start']) >= minimum_duration]
 
         # Always build subtitle output
         lines = []
