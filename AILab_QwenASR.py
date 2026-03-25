@@ -861,7 +861,7 @@ class AILab_Qwen3ASRSubtitle:
                 "minimum_duration": (
                     "FLOAT",
                     {
-                        "default": 0.0,
+                        "default": 0.1,
                         "min": 0.0,
                         "max": 5.0,
                         "step": 0.1,
