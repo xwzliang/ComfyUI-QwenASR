@@ -627,6 +627,123 @@ class Qwen3ASRModel:
 
         return results
 
+    @torch.no_grad()
+    def align_ground_truth_direct(
+        self,
+        audio: Union[AudioLike, List[AudioLike]],
+        ground_truth_text: Union[str, List[str]],
+        context: Union[str, List[str]] = "",
+        language: Optional[Union[str, List[Optional[str]]]] = None,
+        max_force_align_input_seconds: float = 360.0,
+    ) -> List[ASRTranscription]:
+        """
+        Align externally provided reference text to whole audio directly, without chunking.
+
+        This is useful when the reference transcript is trusted and the audio is short enough
+        to fit in one forced-alignment request.
+        """
+        if self.forced_aligner is None:
+            raise ValueError("align_ground_truth_direct() requires `forced_aligner` to be provided at initialization.")
+
+        wavs = normalize_audios(audio)
+        n = len(wavs)
+
+        refs = ground_truth_text if isinstance(ground_truth_text, list) else [ground_truth_text]
+        if len(refs) == 1 and n > 1:
+            refs = refs * n
+        if len(refs) != n:
+            raise ValueError(f"Batch size mismatch: audio={n}, ground_truth_text={len(refs)}")
+
+        ctxs = context if isinstance(context, list) else [context]
+        if len(ctxs) == 1 and n > 1:
+            ctxs = ctxs * n
+        if len(ctxs) != n:
+            raise ValueError(f"Batch size mismatch: audio={n}, context={len(ctxs)}")
+
+        langs_in: List[Optional[str]]
+        if language is None:
+            langs_in = [None] * n
+        else:
+            langs_in = language if isinstance(language, list) else [language]
+            if len(langs_in) == 1 and n > 1:
+                langs_in = langs_in * n
+            if len(langs_in) != n:
+                raise ValueError(f"Batch size mismatch: audio={n}, language={len(langs_in)}")
+
+        langs_norm: List[Optional[str]] = []
+        for l in langs_in:
+            if l is None or str(l).strip() == "":
+                langs_norm.append(None)
+            else:
+                ln = normalize_language_name(str(l))
+                validate_language(ln)
+                langs_norm.append(ln)
+
+        max_seconds = float(max_force_align_input_seconds)
+        if max_seconds <= 0:
+            raise ValueError(
+                f"max_force_align_input_seconds must be > 0, got: {max_force_align_input_seconds}"
+            )
+
+        to_align_audio: List[Tuple[np.ndarray, int]] = []
+        to_align_text: List[str] = []
+        to_align_lang: List[str] = []
+        out_languages: List[str] = []
+
+        for i, (wav, ref_text, forced_lang) in enumerate(zip(wavs, refs, langs_norm)):
+            duration_sec = float(wav.shape[0]) / float(SAMPLE_RATE)
+            if duration_sec > max_seconds:
+                raise ValueError(
+                    "align_ground_truth_direct() does not chunk audio. "
+                    f"Sample {i} is {duration_sec:.3f}s, which exceeds max_force_align_input_seconds={max_seconds:.3f}."
+                )
+
+            resolved_language = self._resolve_alignment_language([], forced_lang)
+            out_languages.append(resolved_language)
+
+            ref_text = str(ref_text or "").strip()
+            if not ref_text:
+                self._log_ground_truth_alignment(
+                    "warning",
+                    f"sample={i} direct alignment skipped because ground_truth_text is empty.",
+                )
+                to_align_audio.append((wav, SAMPLE_RATE))
+                to_align_text.append("")
+                to_align_lang.append(resolved_language)
+                continue
+
+            self._log_ground_truth_alignment(
+                "info",
+                f"sample={i} direct alignment duration={round(duration_sec, 3)}s "
+                f"max_force_align_input_seconds={round(max_seconds, 3)} ref_preview='{self._preview_text(ref_text)}'.",
+            )
+            to_align_audio.append((wav, SAMPLE_RATE))
+            to_align_text.append(ref_text)
+            to_align_lang.append(resolved_language)
+
+        aligned_results = self.forced_aligner.align(
+            audio=to_align_audio,
+            text=to_align_text,
+            language=to_align_lang,
+        )
+
+        results: List[ASRTranscription] = []
+        for i, (ref_text, lang, aligned) in enumerate(zip(refs, out_languages, aligned_results)):
+            item_count = len(getattr(aligned, "items", []) or [])
+            self._log_ground_truth_alignment(
+                "info",
+                f"sample={i} direct alignment produced {item_count} timestamp items.",
+            )
+            results.append(
+                ASRTranscription(
+                    language=lang,
+                    text=str(ref_text or ""),
+                    time_stamps=aligned,
+                )
+            )
+
+        return results
+
     def _build_messages(self, context: str, audio_payload: Any) -> List[Dict[str, Any]]:
         return [
             {"role": "system", "content": context or ""},

@@ -620,6 +620,8 @@ def _run_subtitle_transcription(
     unload_models=True,
     minimum_duration=0.0,
     ground_truth_text="",
+    gt_align_mode="chunked",
+    max_force_align_input_seconds=360.0,
 ):
     if Qwen3ASRModel is None:
         raise RuntimeError(f"qwen-asr not available: {_IMPORT_ERROR}")
@@ -653,12 +655,21 @@ def _run_subtitle_transcription(
     )
 
     if gt_text:
-        results = model.align_ground_truth(
-            audio=audio_data,
-            ground_truth_text=gt_text,
-            language=lang,
-            context=ctx if ctx else None,
-        )
+        if gt_align_mode == "direct":
+            results = model.align_ground_truth_direct(
+                audio=audio_data,
+                ground_truth_text=gt_text,
+                language=lang,
+                context=ctx if ctx else None,
+                max_force_align_input_seconds=max_force_align_input_seconds,
+            )
+        else:
+            results = model.align_ground_truth(
+                audio=audio_data,
+                ground_truth_text=gt_text,
+                language=lang,
+                context=ctx if ctx else None,
+            )
     else:
         results = model.transcribe(
             audio=audio_data,
@@ -1229,6 +1240,214 @@ class AILab_Qwen3ASRSubtitleGroundTruth:
             unload_models=unload_models,
             minimum_duration=minimum_duration,
             ground_truth_text=ground_truth_text,
+            gt_align_mode="chunked",
+        )
+
+
+class AILab_Qwen3ASRSubtitleGroundTruthDirect:
+    @classmethod
+    def INPUT_TYPES(cls):
+        defaults = _get_defaults()
+        return {
+            "required": {
+                "audio": ("AUDIO", {"tooltip": "Audio input to align."}),
+            },
+            "optional": {
+                "model": (
+                    list(_get_model_ids().keys()),
+                    {
+                        "default": defaults.get("repo_id", "Qwen/Qwen3-ASR-0.6B"),
+                        "tooltip": "Choose the ASR model size.",
+                    },
+                ),
+                "precision": (
+                    ["bf16", "fp16", "fp32"],
+                    {
+                        "default": defaults.get("precision", "bf16"),
+                        "tooltip": "Inference precision.",
+                    },
+                ),
+                "attention": (
+                    ["auto", "flash_attention_2", "sdpa", "eager"],
+                    {
+                        "default": defaults.get("attention", "auto"),
+                        "tooltip": "Attention backend override.",
+                    },
+                ),
+                "forced_aligner": (
+                    list(_get_aligner_ids().keys()),
+                    {
+                        "default": defaults.get(
+                            "forced_aligner", "Qwen/Qwen3-ForcedAligner-0.6B"
+                        ),
+                        "tooltip": "Forced aligner for timestamped subtitles.",
+                    },
+                ),
+                "language": (
+                    SUPPORTED_LANGUAGES,
+                    {
+                        "default": defaults.get("language", "auto"),
+                        "tooltip": "Force language or auto-detect.",
+                    },
+                ),
+                "hints": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "tooltip": "Optional context text. Not used for direct GT alignment, but kept for API symmetry.",
+                    },
+                ),
+                "ground_truth_text": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "tooltip": "Reference transcript to align directly to the whole audio without chunking.",
+                    },
+                ),
+                "max_force_align_input_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 360.0,
+                        "min": 1.0,
+                        "max": 7200.0,
+                        "step": 1.0,
+                        "tooltip": "Maximum whole-audio duration allowed for direct GT alignment. Audio longer than this raises an error instead of chunking.",
+                    },
+                ),
+                "output_format": (
+                    ["none", "txt", "srt"],
+                    {
+                        "default": "srt",
+                        "tooltip": "File save format only (does not change subtitle output).",
+                    },
+                ),
+                "output_path": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": "Optional output file path (relative goes to ComfyUI output).",
+                    },
+                ),
+                "split_mode": (
+                    [
+                        "split_by_punctuation_or_pause_or_length",
+                        "split_by_punctuation_or_pause",
+                        "split_by_punctuation_or_length",
+                        "split_by_punctuation",
+                        "split_by_pause",
+                        "split_by_length",
+                    ],
+                    {
+                        "default": "split_by_punctuation_or_pause_or_length",
+                        "tooltip": "Sentence splitting strategy.",
+                    },
+                ),
+                "max_gap_sec": (
+                    "FLOAT",
+                    {
+                        "default": 0.6,
+                        "min": 0.0,
+                        "max": 8.0,
+                        "step": 0.1,
+                        "tooltip": "Max silence gap to keep the same sentence.",
+                    },
+                ),
+                "max_chars": (
+                    "INT",
+                    {
+                        "default": 40,
+                        "min": 0,
+                        "max": 200,
+                        "tooltip": "Optional max characters per line (0 = no limit).",
+                    },
+                ),
+                "max_inference_batch_size": (
+                    "INT",
+                    {
+                        "default": 32,
+                        "min": 1,
+                        "max": 256,
+                        "tooltip": "Batch size for model loading consistency. Direct GT alignment itself uses one whole-audio request.",
+                    },
+                ),
+                "max_new_tokens": (
+                    "INT",
+                    {
+                        "default": 256,
+                        "min": 1,
+                        "max": 2048,
+                        "tooltip": "Unused by direct GT alignment, but kept for cache/key consistency.",
+                    },
+                ),
+                "unload_models": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Unload cached model after inference.",
+                    },
+                ),
+                "minimum_duration": (
+                    "FLOAT",
+                    {
+                        "default": 0.1,
+                        "min": 0.0,
+                        "max": 5.0,
+                        "step": 0.1,
+                        "tooltip": "Drop subtitle segments shorter than this duration (in seconds).",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("TEXT", "SUBTITLES", "LANUGAGE", "OUTPUT_PATH")
+    FUNCTION = "transcribe"
+    CATEGORY = "🧪AILab/🎙️QwenASR"
+
+    def transcribe(
+        self,
+        audio,
+        model="Qwen/Qwen3-ASR-0.6B",
+        precision="bf16",
+        attention="auto",
+        forced_aligner="Qwen/Qwen3-ForcedAligner-0.6B",
+        language="auto",
+        hints="",
+        ground_truth_text="",
+        max_force_align_input_seconds=360.0,
+        output_format="none",
+        output_path="",
+        split_mode="split_by_punctuation_or_pause_or_length",
+        max_gap_sec=0.6,
+        max_chars=60,
+        max_inference_batch_size=32,
+        max_new_tokens=256,
+        unload_models=True,
+        minimum_duration=0.0,
+    ):
+        return _run_subtitle_transcription(
+            audio=audio,
+            model=model,
+            precision=precision,
+            attention=attention,
+            forced_aligner=forced_aligner,
+            language=language,
+            hints=hints,
+            output_format=output_format,
+            output_path=output_path,
+            split_mode=split_mode,
+            max_gap_sec=max_gap_sec,
+            max_chars=max_chars,
+            max_inference_batch_size=max_inference_batch_size,
+            max_new_tokens=max_new_tokens,
+            unload_models=unload_models,
+            minimum_duration=minimum_duration,
+            ground_truth_text=ground_truth_text,
+            gt_align_mode="direct",
+            max_force_align_input_seconds=max_force_align_input_seconds,
         )
 
 
@@ -1236,10 +1455,12 @@ NODE_CLASS_MAPPINGS = {
     "AILab_Qwen3ASR": AILab_Qwen3ASR,
     "AILab_Qwen3ASRSubtitle": AILab_Qwen3ASRSubtitle,
     "AILab_Qwen3ASRSubtitleGroundTruth": AILab_Qwen3ASRSubtitleGroundTruth,
+    "AILab_Qwen3ASRSubtitleGroundTruthDirect": AILab_Qwen3ASRSubtitleGroundTruthDirect,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AILab_Qwen3ASR": "ASR (QwenASR)",
     "AILab_Qwen3ASRSubtitle": "Subtitle (QwenASR)",
     "AILab_Qwen3ASRSubtitleGroundTruth": "Subtitle GT Align (QwenASR)",
+    "AILab_Qwen3ASRSubtitleGroundTruthDirect": "Subtitle GT Align Direct (QwenASR)",
 }
