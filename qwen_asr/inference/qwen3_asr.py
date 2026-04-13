@@ -14,7 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from difflib import SequenceMatcher
+import logging
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -52,6 +54,9 @@ try:
     ModelRegistry.register_model("Qwen3ASRForConditionalGeneration", Qwen3ASRForConditionalGeneration)
 except:
     pass
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -445,6 +450,183 @@ class Qwen3ASRModel:
 
         return results
 
+    @torch.no_grad()
+    def align_ground_truth(
+        self,
+        audio: Union[AudioLike, List[AudioLike]],
+        ground_truth_text: Union[str, List[str]],
+        context: Union[str, List[str]] = "",
+        language: Optional[Union[str, List[Optional[str]]]] = None,
+    ) -> List[ASRTranscription]:
+        """
+        Align externally provided reference text to audio.
+
+        For long audio, this method reuses chunk-level ASR output as a monotonic anchor pass,
+        assigns a chunk-local slice of the reference text to each audio chunk, then runs the
+        forced aligner on those chunk-local reference slices and merges the timestamp results.
+        """
+        if self.forced_aligner is None:
+            raise ValueError("align_ground_truth() requires `forced_aligner` to be provided at initialization.")
+
+        wavs = normalize_audios(audio)
+        n = len(wavs)
+
+        refs = ground_truth_text if isinstance(ground_truth_text, list) else [ground_truth_text]
+        if len(refs) == 1 and n > 1:
+            refs = refs * n
+        if len(refs) != n:
+            raise ValueError(f"Batch size mismatch: audio={n}, ground_truth_text={len(refs)}")
+
+        ctxs = context if isinstance(context, list) else [context]
+        if len(ctxs) == 1 and n > 1:
+            ctxs = ctxs * n
+        if len(ctxs) != n:
+            raise ValueError(f"Batch size mismatch: audio={n}, context={len(ctxs)}")
+
+        langs_in: List[Optional[str]]
+        if language is None:
+            langs_in = [None] * n
+        else:
+            langs_in = language if isinstance(language, list) else [language]
+            if len(langs_in) == 1 and n > 1:
+                langs_in = langs_in * n
+            if len(langs_in) != n:
+                raise ValueError(f"Batch size mismatch: audio={n}, language={len(langs_in)}")
+
+        langs_norm: List[Optional[str]] = []
+        for l in langs_in:
+            if l is None or str(l).strip() == "":
+                langs_norm.append(None)
+            else:
+                ln = normalize_language_name(str(l))
+                validate_language(ln)
+                langs_norm.append(ln)
+
+        chunks: List[AudioChunk] = []
+        for i, wav in enumerate(wavs):
+            parts = split_audio_into_chunks(
+                wav=wav,
+                sr=SAMPLE_RATE,
+                max_chunk_sec=MAX_FORCE_ALIGN_INPUT_SECONDS,
+            )
+            for j, (cwav, offset_sec) in enumerate(parts):
+                chunks.append(AudioChunk(orig_index=i, chunk_index=j, wav=cwav, sr=SAMPLE_RATE, offset_sec=offset_sec))
+
+        chunk_ctx: List[str] = [ctxs[c.orig_index] for c in chunks]
+        chunk_lang: List[Optional[str]] = [langs_norm[c.orig_index] for c in chunks]
+        chunk_wavs: List[np.ndarray] = [c.wav for c in chunks]
+        raw_outputs = self._infer_asr(chunk_ctx, chunk_wavs, chunk_lang)
+
+        per_chunk_lang: List[str] = []
+        per_chunk_text: List[str] = []
+        for out, forced_lang in zip(raw_outputs, chunk_lang):
+            lang, txt = parse_asr_output(out, user_language=forced_lang)
+            per_chunk_lang.append(lang)
+            per_chunk_text.append(txt)
+
+        out_aligns: List[List[Any]] = [[] for _ in range(n)]
+        out_langs: List[List[str]] = [[] for _ in range(n)]
+
+        for i in range(n):
+            sample_chunk_indices = [idx for idx, c in enumerate(chunks) if c.orig_index == i]
+            sample_chunks = [chunks[idx] for idx in sample_chunk_indices]
+            sample_pred_texts = [per_chunk_text[idx] for idx in sample_chunk_indices]
+            sample_pred_langs = [per_chunk_lang[idx] for idx in sample_chunk_indices]
+
+            resolved_language = self._resolve_alignment_language(sample_pred_langs, langs_norm[i])
+            out_langs[i].extend(sample_pred_langs)
+
+            reference = str(refs[i] or "").strip()
+            if not reference:
+                continue
+
+            chunk_durations = [max(0.0, float(c.wav.shape[0]) / float(c.sr)) for c in sample_chunks]
+            chunk_ref_texts = self._split_reference_text_by_chunks(
+                predicted_chunk_texts=sample_pred_texts,
+                reference_text=reference,
+                language=resolved_language,
+                chunk_durations=chunk_durations,
+            )
+
+            to_align_audio: List[Tuple[np.ndarray, int]] = []
+            to_align_text: List[str] = []
+            to_align_lang: List[str] = []
+            to_align_offsets: List[float] = []
+
+            for c, ref_txt, pred_lang in zip(sample_chunks, chunk_ref_texts, sample_pred_langs):
+                ref_txt = str(ref_txt or "").strip()
+                if not ref_txt:
+                    self._log_ground_truth_alignment(
+                        "warning",
+                        f"sample={i} chunk={c.chunk_index} offset={round(c.offset_sec, 3)}s duration={round(float(c.wav.shape[0]) / float(c.sr), 3)}s "
+                        "skipped forced alignment because assigned reference text is empty.",
+                    )
+                    continue
+                to_align_audio.append((c.wav, c.sr))
+                to_align_text.append(ref_txt)
+                to_align_lang.append(self._resolve_alignment_language([pred_lang], resolved_language))
+                to_align_offsets.append(c.offset_sec)
+
+            aligned_results: List[Any] = []
+            for a_chunk, t_chunk, l_chunk in zip(
+                chunk_list(to_align_audio, self.max_inference_batch_size),
+                chunk_list(to_align_text, self.max_inference_batch_size),
+                chunk_list(to_align_lang, self.max_inference_batch_size),
+            ):
+                aligned_results.extend(
+                    self.forced_aligner.align(audio=a_chunk, text=t_chunk, language=l_chunk)
+                )
+
+            prev_end_time: Optional[float] = None
+            for local_idx, (offset_sec, ref_txt, result) in enumerate(zip(to_align_offsets, to_align_text, aligned_results)):
+                shifted = self._offset_align_result(result, offset_sec)
+                out_aligns[i].append(shifted)
+                item_count = len(getattr(shifted, "items", []) or [])
+                if item_count == 0:
+                    self._log_ground_truth_alignment(
+                        "warning",
+                        f"sample={i} aligned_chunk={local_idx} offset={round(offset_sec, 3)}s produced 0 timestamp items; "
+                        f"ref_preview='{self._preview_text(ref_txt)}'.",
+                    )
+                    continue
+
+                first_item = shifted.items[0]
+                last_item = shifted.items[-1]
+                gap_msg = ""
+                if prev_end_time is not None:
+                    gap = float(first_item.start_time) - float(prev_end_time)
+                    if gap > 5.0:
+                        gap_msg = f" large_gap_from_prev={round(gap, 3)}s"
+                        self._log_ground_truth_alignment(
+                            "warning",
+                            f"sample={i} aligned_chunk={local_idx} offset={round(offset_sec, 3)}s has large gap after previous chunk: {round(gap, 3)}s. "
+                            f"first_time={round(float(first_item.start_time), 3)} last_time={round(float(last_item.end_time), 3)} "
+                            f"ref_preview='{self._preview_text(ref_txt)}'.",
+                        )
+                self._log_ground_truth_alignment(
+                    "info",
+                    f"sample={i} aligned_chunk={local_idx} offset={round(offset_sec, 3)}s items={item_count} "
+                    f"time_range={round(float(first_item.start_time), 3)}-{round(float(last_item.end_time), 3)}{gap_msg} "
+                    f"ref_preview='{self._preview_text(ref_txt)}'.",
+                )
+                prev_end_time = float(last_item.end_time)
+
+        results: List[ASRTranscription] = []
+        for i in range(n):
+            merged_language = merge_languages(out_langs[i])
+            if not merged_language:
+                merged_language = langs_norm[i] or ""
+            merged_align = self._merge_align_results(out_aligns[i])
+            results.append(
+                ASRTranscription(
+                    language=merged_language,
+                    text=str(refs[i] or ""),
+                    time_stamps=merged_align,
+                )
+            )
+
+        return results
+
     def _build_messages(self, context: str, audio_payload: Any) -> List[Dict[str, Any]]:
         return [
             {"role": "system", "content": context or ""},
@@ -535,6 +717,318 @@ class Qwen3ASRModel:
             for o in outputs:
                 outs.append(o.outputs[0].text)
         return outs
+
+    def _resolve_alignment_language(
+        self,
+        predicted_languages: List[str],
+        fallback_language: Optional[str],
+    ) -> str:
+        merged_language = merge_languages([l for l in predicted_languages if l])
+        if merged_language:
+            return merged_language.split(",")[0]
+        if fallback_language:
+            return fallback_language
+        return "English"
+
+    def _tokenize_alignment_text(self, text: str, language: str) -> List[str]:
+        if self.forced_aligner is None:
+            return []
+        cleaned_text = str(text or "").strip()
+        if not cleaned_text:
+            return []
+        lang = self._resolve_alignment_language([language], None)
+        try:
+            tokens, _ = self.forced_aligner.aligner_processor.encode_timestamp(cleaned_text, lang)
+        except Exception:
+            tokens = cleaned_text.split()
+        return [str(t) for t in tokens if str(t).strip()]
+
+    def _log_ground_truth_alignment(self, level: str, message: str) -> None:
+        formatted = f"[Qwen3ASR][GTAlign] {message}"
+        log_fn = getattr(logger, level, logger.info)
+        log_fn(formatted)
+        print(formatted)
+
+    def _preview_text(self, text: str, limit: int = 32) -> str:
+        text = str(text or "").replace("\n", " ").strip()
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "..."
+
+    def _match_reference_window(
+        self,
+        predicted_tokens: List[str],
+        reference_tokens: List[str],
+        cursor: int,
+        expected_center: Optional[float] = None,
+    ) -> Optional[Tuple[int, int, float]]:
+        if not predicted_tokens:
+            return (cursor, cursor, 1.0)
+        if cursor >= len(reference_tokens):
+            return None
+
+        target_len = len(predicted_tokens)
+        look_ahead = max(40, target_len * 3)
+        max_start = min(len(reference_tokens) - 1, cursor + look_ahead)
+        min_len = max(1, target_len - max(4, target_len // 2))
+        max_len = min(len(reference_tokens), target_len + max(4, target_len // 2))
+
+        best_span: Optional[Tuple[int, int]] = None
+        best_score = float("-inf")
+
+        for start in range(cursor, max_start + 1):
+            local_max_len = min(max_len, len(reference_tokens) - start)
+            local_min_len = min(min_len, local_max_len)
+            for win_len in range(local_min_len, local_max_len + 1):
+                candidate = reference_tokens[start : start + win_len]
+                cand_center = start + (0.5 * win_len)
+                score = SequenceMatcher(None, predicted_tokens, candidate, autojunk=False).ratio()
+                score -= abs(win_len - target_len) * 0.01
+                score -= (start - cursor) * 0.001
+                if expected_center is not None:
+                    score -= abs(cand_center - expected_center) * 0.01
+                if score > best_score:
+                    best_score = score
+                    best_span = (start, start + win_len)
+
+        if best_score < 0.2:
+            return None
+        return (best_span[0], best_span[1], best_score)
+
+    def _allocate_reference_spans_by_duration(
+        self,
+        token_count: int,
+        durations: List[float],
+    ) -> List[Tuple[int, int]]:
+        if token_count <= 0:
+            return [(0, 0) for _ in durations]
+        total_duration = sum(max(0.0, d) for d in durations)
+        if total_duration <= 0:
+            total_duration = float(len(durations))
+            durations = [1.0] * len(durations)
+
+        boundaries = [0]
+        cumulative = 0.0
+        for dur in durations[:-1]:
+            cumulative += max(0.0, dur)
+            boundaries.append(int(round((cumulative / total_duration) * token_count)))
+        boundaries.append(token_count)
+
+        spans: List[Tuple[int, int]] = []
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            start = max(0, min(start, token_count))
+            end = max(start, min(end, token_count))
+            spans.append((start, end))
+        return spans
+
+    def _split_reference_text_by_chunks(
+        self,
+        predicted_chunk_texts: List[str],
+        reference_text: str,
+        language: str,
+        chunk_durations: List[float],
+    ) -> List[str]:
+        debug_prefix = f"lang={language} chunks={len(predicted_chunk_texts)}"
+        reference_tokens = self._tokenize_alignment_text(reference_text, language)
+        predicted_token_groups = [
+            self._tokenize_alignment_text(chunk_text, language) for chunk_text in predicted_chunk_texts
+        ]
+
+        if not reference_tokens:
+            self._log_ground_truth_alignment(
+                "warning",
+                f"{debug_prefix} reference tokenization produced 0 tokens; all chunk references will be empty.",
+            )
+            return [""] * len(predicted_chunk_texts)
+
+        if sum(len(tokens) for tokens in predicted_token_groups) == 0:
+            spans = self._allocate_reference_spans_by_duration(len(reference_tokens), chunk_durations)
+            self._log_ground_truth_alignment(
+                "warning",
+                f"{debug_prefix} anchor ASR produced 0 usable tokens; falling back to duration-only split across {len(reference_tokens)} reference tokens.",
+            )
+            return [
+                " ".join(reference_tokens[start:end]).strip()
+                for start, end in spans
+            ]
+
+        chunk_count = len(predicted_chunk_texts)
+        anchor_spans: List[Optional[Tuple[int, int]]] = [None] * chunk_count
+        anchor_scores: List[Optional[float]] = [None] * chunk_count
+        anchor_expected_centers: List[Optional[float]] = [None] * chunk_count
+        cursor = 0
+        total_duration = sum(max(0.0, d) for d in chunk_durations)
+        if total_duration <= 0:
+            total_duration = float(max(1, chunk_count))
+            duration_weights = [1.0] * chunk_count
+        else:
+            duration_weights = [max(0.0, d) for d in chunk_durations]
+        cumulative_time = 0.0
+
+        for idx, predicted_tokens in enumerate(predicted_token_groups):
+            duration = duration_weights[idx]
+            expected_center = (
+                len(reference_tokens) * ((cumulative_time + (0.5 * duration)) / total_duration)
+                if total_duration > 0
+                else None
+            )
+            anchor_expected_centers[idx] = expected_center
+            cumulative_time += duration
+            if not predicted_tokens:
+                continue
+            match = self._match_reference_window(
+                predicted_tokens,
+                reference_tokens,
+                cursor,
+                expected_center=expected_center,
+            )
+            if match is None:
+                self._log_ground_truth_alignment(
+                    "warning",
+                    f"{debug_prefix} chunk={idx} anchor match failed after cursor={cursor}; "
+                    f"expected_center={round(expected_center, 1) if expected_center is not None else 'n/a'} "
+                    f"pred_tokens={len(predicted_tokens)} pred_preview='{self._preview_text(predicted_chunk_texts[idx])}'.",
+                )
+                continue
+
+            start, end, score = match
+            start = max(start, cursor)
+            end = max(end, start)
+            anchor_spans[idx] = (start, end)
+            anchor_scores[idx] = score
+            cursor = end
+            self._log_ground_truth_alignment(
+                "info",
+                f"{debug_prefix} chunk={idx} anchor_span={start}:{end} anchor_tokens={end - start} "
+                f"score={round(score, 4)} expected_center={round(expected_center, 1) if expected_center is not None else 'n/a'} "
+                f"actual_center={round((start + end) * 0.5, 1)} pred_preview='{self._preview_text(predicted_chunk_texts[idx])}'.",
+            )
+
+        anchor_indices = [idx for idx, span in enumerate(anchor_spans) if span is not None]
+        if not anchor_indices:
+            spans = self._allocate_reference_spans_by_duration(len(reference_tokens), chunk_durations)
+            self._log_ground_truth_alignment(
+                "warning",
+                f"{debug_prefix} no chunk anchors matched; using duration-only split across {len(reference_tokens)} reference tokens.",
+            )
+            return [
+                " ".join(reference_tokens[start:end]).strip()
+                for start, end in spans
+            ]
+
+        centers: List[float] = [0.0] * chunk_count
+        first_anchor_idx = anchor_indices[0]
+        first_anchor = anchor_spans[first_anchor_idx]
+        assert first_anchor is not None
+        first_center = 0.5 * (first_anchor[0] + first_anchor[1])
+
+        prefix_durations = [max(0.0, d) for d in chunk_durations[: first_anchor_idx + 1]]
+        prefix_total = sum(prefix_durations) or float(first_anchor_idx + 1)
+        cumulative = 0.0
+        for idx in range(first_anchor_idx + 1):
+            cumulative += prefix_durations[idx] if sum(prefix_durations) > 0 else 1.0
+            centers[idx] = first_center * (cumulative / prefix_total)
+
+        for left_idx, right_idx in zip(anchor_indices, anchor_indices[1:]):
+            left_anchor = anchor_spans[left_idx]
+            right_anchor = anchor_spans[right_idx]
+            assert left_anchor is not None and right_anchor is not None
+            left_center = 0.5 * (left_anchor[0] + left_anchor[1])
+            right_center = 0.5 * (right_anchor[0] + right_anchor[1])
+            segment_durations = [max(0.0, d) for d in chunk_durations[left_idx : right_idx + 1]]
+            segment_total = sum(segment_durations) or float(right_idx - left_idx + 1)
+            cumulative = 0.0
+            for idx in range(left_idx, right_idx + 1):
+                if idx == left_idx:
+                    centers[idx] = left_center
+                    continue
+                cumulative += segment_durations[idx - left_idx - 1] if sum(segment_durations) > 0 else 1.0
+                ratio = cumulative / segment_total
+                centers[idx] = left_center + (right_center - left_center) * ratio
+
+        last_anchor_idx = anchor_indices[-1]
+        last_anchor = anchor_spans[last_anchor_idx]
+        assert last_anchor is not None
+        last_center = 0.5 * (last_anchor[0] + last_anchor[1])
+        suffix_durations = [max(0.0, d) for d in chunk_durations[last_anchor_idx:]]
+        suffix_total = sum(suffix_durations) or float(chunk_count - last_anchor_idx)
+        cumulative = 0.0
+        for idx in range(last_anchor_idx, chunk_count):
+            if idx == last_anchor_idx:
+                centers[idx] = last_center
+                continue
+            cumulative += suffix_durations[idx - last_anchor_idx - 1] if sum(suffix_durations) > 0 else 1.0
+            ratio = cumulative / suffix_total
+            centers[idx] = last_center + (len(reference_tokens) - last_center) * ratio
+
+        boundaries: List[int] = [0]
+        for idx in range(1, chunk_count):
+            boundary = int(round((centers[idx - 1] + centers[idx]) * 0.5))
+            boundaries.append(boundary)
+        boundaries.append(len(reference_tokens))
+
+        spans: List[Tuple[int, int]] = []
+        prev_end = 0
+        for idx in range(chunk_count):
+            start = max(prev_end, min(boundaries[idx], len(reference_tokens)))
+            end = max(start, min(boundaries[idx + 1], len(reference_tokens)))
+            spans.append((start, end))
+            prev_end = end
+
+        for idx in anchor_indices:
+            anchor_start, anchor_end = anchor_spans[idx]
+            start, end = spans[idx]
+            if anchor_start < start:
+                start = anchor_start
+            if anchor_end > end:
+                end = anchor_end
+            spans[idx] = (start, end)
+
+        fixed_spans: List[Tuple[int, int]] = []
+        prev_end = 0
+        for idx, (start, end) in enumerate(spans):
+            start = max(prev_end, min(start, len(reference_tokens)))
+            end = max(start, min(end, len(reference_tokens)))
+            fixed_spans.append((start, end))
+            prev_end = end
+        if fixed_spans:
+            fixed_spans[-1] = (fixed_spans[-1][0], len(reference_tokens))
+
+        assigned_token_count = sum(max(0, end - start) for start, end in fixed_spans)
+        self._log_ground_truth_alignment(
+            "info",
+            f"{debug_prefix} reference_tokens={len(reference_tokens)} anchor_chunks={len(anchor_indices)}/{chunk_count} "
+            f"assigned_tokens={assigned_token_count}.",
+        )
+        if assigned_token_count != len(reference_tokens):
+            self._log_ground_truth_alignment(
+                "warning",
+                f"{debug_prefix} coverage mismatch: assigned_tokens={assigned_token_count} reference_tokens={len(reference_tokens)}. "
+                "This indicates some reference tokens were still not assigned to any chunk.",
+            )
+
+        chunk_ref_texts: List[str] = []
+        for idx, (start, end) in enumerate(fixed_spans):
+            ref_text = " ".join(reference_tokens[start:end]).strip()
+            reason = "anchor" if anchor_spans[idx] is not None else "interpolated"
+            score = anchor_scores[idx]
+            if not ref_text:
+                self._log_ground_truth_alignment(
+                    "warning",
+                    f"{debug_prefix} chunk={idx} final_span={start}:{end} tokens=0 reason={reason}; "
+                    f"pred_tokens={len(predicted_token_groups[idx])} pred_preview='{self._preview_text(predicted_chunk_texts[idx])}'.",
+                )
+            else:
+                self._log_ground_truth_alignment(
+                    "info",
+                    f"{debug_prefix} chunk={idx} final_span={start}:{end} tokens={end - start} reason={reason} "
+                    f"score={score if score is not None else 'n/a'} expected_center={round(anchor_expected_centers[idx], 1) if anchor_expected_centers[idx] is not None else 'n/a'} "
+                    f"pred_tokens={len(predicted_token_groups[idx])} "
+                    f"pred_preview='{self._preview_text(predicted_chunk_texts[idx])}' ref_preview='{self._preview_text(ref_text)}'.",
+                )
+            chunk_ref_texts.append(ref_text)
+
+        return chunk_ref_texts
 
     def _offset_align_result(self, result: Any, offset_sec: float) -> Any:
         """

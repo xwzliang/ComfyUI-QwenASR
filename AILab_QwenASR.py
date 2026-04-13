@@ -602,6 +602,130 @@ def _group_time_stamps(
     return groups
 
 
+def _run_subtitle_transcription(
+    audio,
+    model="Qwen/Qwen3-ASR-0.6B",
+    precision="bf16",
+    attention="auto",
+    forced_aligner="Qwen/Qwen3-ForcedAligner-0.6B",
+    language="auto",
+    hints="",
+    output_format="none",
+    output_path="",
+    split_mode="split_by_punctuation_or_pause_or_length",
+    max_gap_sec=0.6,
+    max_chars=60,
+    max_inference_batch_size=32,
+    max_new_tokens=256,
+    unload_models=True,
+    minimum_duration=0.0,
+    ground_truth_text="",
+):
+    if Qwen3ASRModel is None:
+        raise RuntimeError(f"qwen-asr not available: {_IMPORT_ERROR}")
+
+    device = model_management.get_torch_device()
+    dtype = _build_dtype(precision, device)
+
+    source = _get_defaults().get("source", "HuggingFace")
+    model_path = _resolve_model_path(model, source)
+
+    forced_aligner_path = ""
+    if forced_aligner and forced_aligner != "None":
+        forced_aligner_path = _resolve_model_path(forced_aligner, source)
+
+    audio_data = _normalize_audio(audio)
+    if audio_data is None:
+        return ("", "", "", "")
+
+    lang = None if language == "auto" else language
+    ctx = hints.strip() if isinstance(hints, str) else ""
+    gt_text = ground_truth_text.strip() if isinstance(ground_truth_text, str) else ""
+
+    model = _load_cached_model(
+        model_path,
+        dtype,
+        device,
+        attention,
+        forced_aligner_path,
+        max_inference_batch_size=max_inference_batch_size,
+        max_new_tokens=max_new_tokens,
+    )
+
+    if gt_text:
+        results = model.align_ground_truth(
+            audio=audio_data,
+            ground_truth_text=gt_text,
+            language=lang,
+            context=ctx if ctx else None,
+        )
+    else:
+        results = model.transcribe(
+            audio=audio_data,
+            language=lang,
+            context=ctx if ctx else None,
+            return_time_stamps=True,
+        )
+
+    result = results[0]
+    text = result.text or ""
+    detected_lang = result.language or ""
+    file_content = ""
+    file_path = ""
+    time_stamps = getattr(result, "time_stamps", None)
+
+    if time_stamps and text:
+        time_stamps = _align_punctuation_to_stamps(text, time_stamps)
+
+    groups = _group_time_stamps(
+        time_stamps,
+        max_gap_sec=max_gap_sec,
+        max_chars=max_chars,
+        split_mode=split_mode,
+    )
+
+    if minimum_duration > 0:
+        groups = [g for g in groups if (g["end"] - g["start"]) >= minimum_duration]
+
+    lines = []
+    for g in groups:
+        lines.append(f"{g['start']:.2f}-{g['end']:.2f}: {g['text']}")
+    subtitles = "\n".join(lines) if lines else ""
+
+    if output_format != "none":
+        out_path = (output_path or "").strip()
+        if not os.path.isabs(out_path):
+            if out_path == "":
+                out_path = _default_output_dir()
+            out_path = os.path.join(folder_paths.get_output_directory(), out_path)
+
+        if _is_dir_path(out_path):
+            ext = ".srt" if output_format == "srt" else ".txt"
+            out_path = os.path.join(out_path, _make_default_filename(ext))
+        else:
+            root, ext = os.path.splitext(out_path)
+            if not ext:
+                ext = ".srt" if output_format == "srt" else ".txt"
+                out_path = root + ext
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        if output_format == "srt":
+            file_content = _build_srt_from_groups(groups)
+        else:
+            file_content = subtitles
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(file_content)
+        file_path = out_path
+
+    if unload_models:
+        _ASR_MODEL_CACHE.clear()
+        try:
+            model_management.soft_empty_cache()
+        except Exception:
+            pass
+
+    return (text, file_content, detected_lang, file_path)
+
+
 def _build_srt_from_groups(groups) -> str:
     if not groups:
         return ""
@@ -788,7 +912,7 @@ class AILab_Qwen3ASRSubtitle:
                 "output_format": (
                     ["none", "txt", "srt"],
                     {
-                        "default": "none",
+                        "default": "srt",
                         "tooltip": "File save format only (does not change subtitle output).",
                     },
                 ),
@@ -895,111 +1019,227 @@ class AILab_Qwen3ASRSubtitle:
         unload_models=True,
         minimum_duration=0.0,
     ):
-        if Qwen3ASRModel is None:
-            raise RuntimeError(f"qwen-asr not available: {_IMPORT_ERROR}")
-
-        device = model_management.get_torch_device()
-        dtype = _build_dtype(precision, device)
-
-        source = _get_defaults().get("source", "HuggingFace")
-        model_path = _resolve_model_path(model, source)
-
-        forced_aligner_path = ""
-        if forced_aligner and forced_aligner != "None":
-            forced_aligner_path = _resolve_model_path(forced_aligner, source)
-
-        audio_data = _normalize_audio(audio)
-        if audio_data is None:
-            return ("", "", "")
-
-        lang = None if language == "auto" else language
-        ctx = hints.strip() if isinstance(hints, str) else ""
-
-        model = _load_cached_model(
-            model_path,
-            dtype,
-            device,
-            attention,
-            forced_aligner_path,
-            max_inference_batch_size=max_inference_batch_size,
-            max_new_tokens=max_new_tokens,
-        )
-        results = model.transcribe(
-            audio=audio_data,
-            language=lang,
-            context=ctx if ctx else None,
-            return_time_stamps=True,
-        )
-
-        result = results[0]
-        text = result.text or ""
-        detected_lang = result.language or ""
-        subtitles = ""
-        file_path = ""
-        time_stamps = getattr(result, "time_stamps", None)
-
-        # APPLY PUNCTUATION ALIGNMENT HERE
-        if time_stamps and text:
-            time_stamps = _align_punctuation_to_stamps(text, time_stamps)
-
-        groups = _group_time_stamps(
-            time_stamps,
+        return _run_subtitle_transcription(
+            audio=audio,
+            model=model,
+            precision=precision,
+            attention=attention,
+            forced_aligner=forced_aligner,
+            language=language,
+            hints=hints,
+            output_format=output_format,
+            output_path=output_path,
+            split_mode=split_mode,
             max_gap_sec=max_gap_sec,
             max_chars=max_chars,
-            split_mode=split_mode,
+            max_inference_batch_size=max_inference_batch_size,
+            max_new_tokens=max_new_tokens,
+            unload_models=unload_models,
+            minimum_duration=minimum_duration,
         )
 
-        # Filter out segments that are shorter than the minimum duration
-        if minimum_duration > 0:
-            groups = [g for g in groups if (g['end'] - g['start']) >= minimum_duration]
+class AILab_Qwen3ASRSubtitleGroundTruth:
+    @classmethod
+    def INPUT_TYPES(cls):
+        defaults = _get_defaults()
+        return {
+            "required": {
+                "audio": ("AUDIO", {"tooltip": "Audio input to transcribe."}),
+            },
+            "optional": {
+                "model": (
+                    list(_get_model_ids().keys()),
+                    {
+                        "default": defaults.get("repo_id", "Qwen/Qwen3-ASR-0.6B"),
+                        "tooltip": "Choose the ASR model size.",
+                    },
+                ),
+                "precision": (
+                    ["bf16", "fp16", "fp32"],
+                    {
+                        "default": defaults.get("precision", "bf16"),
+                        "tooltip": "Inference precision.",
+                    },
+                ),
+                "attention": (
+                    ["auto", "flash_attention_2", "sdpa", "eager"],
+                    {
+                        "default": defaults.get("attention", "auto"),
+                        "tooltip": "Attention backend override.",
+                    },
+                ),
+                "forced_aligner": (
+                    list(_get_aligner_ids().keys()),
+                    {
+                        "default": defaults.get(
+                            "forced_aligner", "Qwen/Qwen3-ForcedAligner-0.6B"
+                        ),
+                        "tooltip": "Forced aligner for timestamped subtitles.",
+                    },
+                ),
+                "language": (
+                    SUPPORTED_LANGUAGES,
+                    {
+                        "default": defaults.get("language", "auto"),
+                        "tooltip": "Force language or auto-detect.",
+                    },
+                ),
+                "hints": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "tooltip": "Optional hints/keywords (names, terms) to improve anchor ASR.",
+                    },
+                ),
+                "ground_truth_text": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "tooltip": "Optional reference transcript. If provided, chunked forced alignment uses this text instead of ASR output.",
+                    },
+                ),
+                "output_format": (
+                    ["none", "txt", "srt"],
+                    {
+                        "default": "none",
+                        "tooltip": "File save format only (does not change subtitle output).",
+                    },
+                ),
+                "output_path": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": "Optional output file path (relative goes to ComfyUI output).",
+                    },
+                ),
+                "split_mode": (
+                    [
+                        "split_by_punctuation_or_pause_or_length",
+                        "split_by_punctuation_or_pause",
+                        "split_by_punctuation_or_length",
+                        "split_by_punctuation",
+                        "split_by_pause",
+                        "split_by_length",
+                    ],
+                    {
+                        "default": "split_by_punctuation_or_pause_or_length",
+                        "tooltip": "Sentence splitting strategy.",
+                    },
+                ),
+                "max_gap_sec": (
+                    "FLOAT",
+                    {
+                        "default": 0.6,
+                        "min": 0.0,
+                        "max": 8.0,
+                        "step": 0.1,
+                        "tooltip": "Max silence gap to keep the same sentence.",
+                    },
+                ),
+                "max_chars": (
+                    "INT",
+                    {
+                        "default": 40,
+                        "min": 0,
+                        "max": 200,
+                        "tooltip": "Optional max characters per line (0 = no limit).",
+                    },
+                ),
+                "max_inference_batch_size": (
+                    "INT",
+                    {
+                        "default": 32,
+                        "min": 1,
+                        "max": 256,
+                        "tooltip": "Batch size for inference/alignment to avoid OOM.",
+                    },
+                ),
+                "max_new_tokens": (
+                    "INT",
+                    {
+                        "default": 256,
+                        "min": 1,
+                        "max": 2048,
+                        "tooltip": "Max new tokens per chunk for the anchor ASR pass.",
+                    },
+                ),
+                "unload_models": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Unload cached model after inference.",
+                    },
+                ),
+                "minimum_duration": (
+                    "FLOAT",
+                    {
+                        "default": 0.1,
+                        "min": 0.0,
+                        "max": 5.0,
+                        "step": 0.1,
+                        "tooltip": "Drop subtitle segments shorter than this duration (in seconds).",
+                    },
+                ),
+            },
+        }
 
-        # Always build subtitle output
-        lines = []
-        for g in groups:
-            lines.append(f"{g['start']:.2f}-{g['end']:.2f}: {g['text']}")
-        subtitles = "\n".join(lines) if lines else ""
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("TEXT", "SUBTITLES", "LANUGAGE", "OUTPUT_PATH")
+    FUNCTION = "transcribe"
+    CATEGORY = "🧪AILab/🎙️QwenASR"
 
-        # Optional file save
-        if output_format != "none":
-            out_path = (output_path or "").strip()
-            if not os.path.isabs(out_path):
-                if out_path == "":
-                    out_path = _default_output_dir()
-                out_path = os.path.join(folder_paths.get_output_directory(), out_path)
-
-            if _is_dir_path(out_path):
-                ext = ".srt" if output_format == "srt" else ".txt"
-                out_path = os.path.join(out_path, _make_default_filename(ext))
-            else:
-                root, ext = os.path.splitext(out_path)
-                if not ext:
-                    ext = ".srt" if output_format == "srt" else ".txt"
-                    out_path = root + ext
-            os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            if output_format == "srt":
-                file_content = _build_srt_from_groups(groups)
-            else:
-                file_content = subtitles
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write(file_content)
-            file_path = out_path
-
-        if unload_models:
-            _ASR_MODEL_CACHE.clear()
-            try:
-                model_management.soft_empty_cache()
-            except Exception:
-                pass
-
-        return (text, file_content, detected_lang, file_path)
+    def transcribe(
+        self,
+        audio,
+        model="Qwen/Qwen3-ASR-0.6B",
+        precision="bf16",
+        attention="auto",
+        forced_aligner="Qwen/Qwen3-ForcedAligner-0.6B",
+        language="auto",
+        hints="",
+        ground_truth_text="",
+        output_format="none",
+        output_path="",
+        split_mode="split_by_punctuation_or_pause_or_length",
+        max_gap_sec=0.6,
+        max_chars=60,
+        max_inference_batch_size=32,
+        max_new_tokens=256,
+        unload_models=True,
+        minimum_duration=0.0,
+    ):
+        return _run_subtitle_transcription(
+            audio=audio,
+            model=model,
+            precision=precision,
+            attention=attention,
+            forced_aligner=forced_aligner,
+            language=language,
+            hints=hints,
+            output_format=output_format,
+            output_path=output_path,
+            split_mode=split_mode,
+            max_gap_sec=max_gap_sec,
+            max_chars=max_chars,
+            max_inference_batch_size=max_inference_batch_size,
+            max_new_tokens=max_new_tokens,
+            unload_models=unload_models,
+            minimum_duration=minimum_duration,
+            ground_truth_text=ground_truth_text,
+        )
 
 
 NODE_CLASS_MAPPINGS = {
     "AILab_Qwen3ASR": AILab_Qwen3ASR,
     "AILab_Qwen3ASRSubtitle": AILab_Qwen3ASRSubtitle,
+    "AILab_Qwen3ASRSubtitleGroundTruth": AILab_Qwen3ASRSubtitleGroundTruth,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AILab_Qwen3ASR": "ASR (QwenASR)",
     "AILab_Qwen3ASRSubtitle": "Subtitle (QwenASR)",
+    "AILab_Qwen3ASRSubtitleGroundTruth": "Subtitle GT Align (QwenASR)",
 }
