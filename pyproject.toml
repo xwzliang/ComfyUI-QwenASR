@@ -16,10 +16,12 @@ dependencies = [
 	"torch>=2.0.0",
 	"torchaudio>=2.0.0",
 	"transformers>=4.57.0",
+	"pypinyin",
+	"rapidfuzz",
 ]
     
 [project.urls]
-Repository = "https://github.com/1038lab/ComfyUI-QwenASR"
+Repository = "https://github.com/xwzliang/ComfyUI-QwenASR"
 #  Used by Comfy Registry https://comfyregistry.org
 
 [tool.comfy]
