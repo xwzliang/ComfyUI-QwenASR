@@ -72,7 +72,7 @@ logger = logging.getLogger(__name__)
 
 _PUNCT_OR_SPACE_RE = re.compile(r"[\W_]+", re.UNICODE)
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
-GT_ALIGN_ASR_CHUNK_SECONDS = 60.0
+TIMESTAMP_ASR_CHUNK_SECONDS = 45.0
 
 
 @dataclass
@@ -384,7 +384,11 @@ class Qwen3ASRModel:
                 validate_language(ln)
                 langs_norm.append(ln)
 
-        max_chunk_sec = MAX_FORCE_ALIGN_INPUT_SECONDS if return_time_stamps else MAX_ASR_INPUT_SECONDS
+        max_chunk_sec = (
+            min(float(MAX_FORCE_ALIGN_INPUT_SECONDS), TIMESTAMP_ASR_CHUNK_SECONDS)
+            if return_time_stamps
+            else MAX_ASR_INPUT_SECONDS
+        )
 
         # chunk audios and record mapping
         chunks: List[AudioChunk] = []
@@ -518,149 +522,58 @@ class Qwen3ASRModel:
                 validate_language(ln)
                 langs_norm.append(ln)
 
-        chunks: List[AudioChunk] = []
-        gt_anchor_chunk_sec = min(float(MAX_FORCE_ALIGN_INPUT_SECONDS), GT_ALIGN_ASR_CHUNK_SECONDS)
-        for i, wav in enumerate(wavs):
-            parts = split_audio_into_chunks(
-                wav=wav,
-                sr=SAMPLE_RATE,
-                max_chunk_sec=gt_anchor_chunk_sec,
-            )
-            for j, (cwav, offset_sec) in enumerate(parts):
-                chunks.append(AudioChunk(orig_index=i, chunk_index=j, wav=cwav, sr=SAMPLE_RATE, offset_sec=offset_sec))
-
-        chunk_ctx: List[str] = [ctxs[c.orig_index] for c in chunks]
-        chunk_lang: List[Optional[str]] = [langs_norm[c.orig_index] for c in chunks]
-        chunk_wavs: List[np.ndarray] = [c.wav for c in chunks]
-        raw_outputs = self._infer_asr(chunk_ctx, chunk_wavs, chunk_lang)
-
-        per_chunk_lang: List[str] = []
-        per_chunk_text: List[str] = []
-        for out, forced_lang in zip(raw_outputs, chunk_lang):
-            lang, txt = parse_asr_output(out, user_language=forced_lang)
-            per_chunk_lang.append(lang)
-            per_chunk_text.append(txt)
+        asr_results = self.transcribe(
+            audio=[(wav, SAMPLE_RATE) for wav in wavs],
+            context=ctxs,
+            language=langs_norm,
+            return_time_stamps=True,
+        )
 
         out_aligns: List[List[Any]] = [[] for _ in range(n)]
         out_langs: List[List[str]] = [[] for _ in range(n)]
 
         for i in range(n):
-            sample_chunk_indices = [idx for idx, c in enumerate(chunks) if c.orig_index == i]
-            sample_chunks = [chunks[idx] for idx in sample_chunk_indices]
-            sample_pred_texts = [per_chunk_text[idx] for idx in sample_chunk_indices]
-            sample_pred_langs = [per_chunk_lang[idx] for idx in sample_chunk_indices]
-
-            resolved_language = self._resolve_alignment_language(sample_pred_langs, langs_norm[i])
-            out_langs[i].extend(sample_pred_langs)
+            asr_result = asr_results[i]
+            resolved_language = self._resolve_alignment_language([asr_result.language], langs_norm[i])
+            if asr_result.language:
+                out_langs[i].append(asr_result.language)
 
             reference = str(refs[i] or "").strip()
             if not reference:
                 continue
 
-            to_align_audio: List[Tuple[np.ndarray, int]] = []
-            to_align_text: List[str] = []
-            to_align_lang: List[str] = []
-            to_align_offsets: List[float] = []
-
-            for c, pred_txt, pred_lang in zip(sample_chunks, sample_pred_texts, sample_pred_langs):
-                pred_txt = str(pred_txt or "").strip()
-                if not pred_txt:
-                    self._log_ground_truth_alignment(
-                        "warning",
-                        f"sample={i} chunk={c.chunk_index} offset={round(c.offset_sec, 3)}s duration={round(float(c.wav.shape[0]) / float(c.sr), 3)}s "
-                        "skipped ASR timestamp alignment because chunk ASR text is empty.",
-                    )
-                    continue
-                to_align_audio.append((c.wav, c.sr))
-                to_align_text.append(pred_txt)
-                to_align_lang.append(self._resolve_alignment_language([pred_lang], resolved_language))
-                to_align_offsets.append(c.offset_sec)
-
-            aligned_results: List[Any] = []
-            for a_chunk, t_chunk, l_chunk in zip(
-                chunk_list(to_align_audio, self.max_inference_batch_size),
-                chunk_list(to_align_text, self.max_inference_batch_size),
-                chunk_list(to_align_lang, self.max_inference_batch_size),
-            ):
-                aligned_results.extend(
-                    self.forced_aligner.align(audio=a_chunk, text=t_chunk, language=l_chunk)
-                )
-
-            asr_aligned_results: List[Any] = []
-            for local_idx, (offset_sec, pred_txt, result) in enumerate(zip(to_align_offsets, to_align_text, aligned_results)):
-                shifted = self._offset_align_result(result, offset_sec)
-                item_count = len(getattr(shifted, "items", []) or [])
-                if item_count == 0:
-                    self._log_ground_truth_alignment(
-                        "warning",
-                        f"sample={i} asr_chunk={local_idx} offset={round(offset_sec, 3)}s produced 0 timestamp items; "
-                        f"pred_preview='{self._preview_text(pred_txt)}'.",
-                    )
-                    continue
-                asr_aligned_results.append(shifted)
-                first_item = shifted.items[0]
-                last_item = shifted.items[-1]
+            asr_items = list(getattr(asr_result.time_stamps, "items", []) or [])
+            if not asr_items:
                 self._log_ground_truth_alignment(
-                    "info",
-                    f"sample={i} asr_chunk={local_idx} offset={round(offset_sec, 3)}s items={item_count} "
-                    f"time_range={round(float(first_item.start_time), 3)}-{round(float(last_item.end_time), 3)} "
-                    f"pred_preview='{self._preview_text(pred_txt)}'.",
+                    "warning",
+                    f"sample={i} ASR transcription produced 0 timestamp items; cannot correct ground truth.",
                 )
-                self._log_text_sentences_with_item_times(
-                    sample_idx=i,
-                    label="asr_chunk",
-                    text=pred_txt,
-                    language=resolved_language,
-                    items=list(getattr(shifted, "items", []) or []),
-                    chunk_idx=local_idx,
-                )
+                continue
+
+            self._log_ground_truth_alignment(
+                "info",
+                f"sample={i} asr items={len(asr_items)} time_range={round(float(asr_items[0].start_time), 3)}-{round(float(asr_items[-1].end_time), 3)} "
+                f"pred_preview='{self._preview_text(asr_result.text)}'.",
+            )
+            self._log_text_sentences_with_item_times(
+                sample_idx=i,
+                label="asr",
+                text=asr_result.text,
+                language=resolved_language,
+                items=asr_items,
+            )
 
             gt_aligned_result = self._align_reference_to_asr_timestamps(
                 reference_text=reference,
                 language=resolved_language,
-                asr_aligned_results=asr_aligned_results,
+                asr_aligned_results=[asr_result.time_stamps],
                 sample_idx=i,
             )
             if gt_aligned_result is None:
                 self._log_ground_truth_alignment(
                     "warning",
-                    f"sample={i} global GT alignment via ASR timestamps produced no result; falling back to chunk-local GT alignment.",
+                    f"sample={i} global GT alignment via ASR timestamps produced no result.",
                 )
-                chunk_durations = [max(0.0, float(c.wav.shape[0]) / float(c.sr)) for c in sample_chunks]
-                chunk_ref_texts = self._split_reference_text_by_chunks(
-                    predicted_chunk_texts=sample_pred_texts,
-                    reference_text=reference,
-                    language=resolved_language,
-                    chunk_durations=chunk_durations,
-                )
-
-                fallback_audio: List[Tuple[np.ndarray, int]] = []
-                fallback_text: List[str] = []
-                fallback_lang: List[str] = []
-                fallback_offsets: List[float] = []
-
-                for c, ref_txt, pred_lang in zip(sample_chunks, chunk_ref_texts, sample_pred_langs):
-                    ref_txt = str(ref_txt or "").strip()
-                    if not ref_txt:
-                        continue
-                    fallback_audio.append((c.wav, c.sr))
-                    fallback_text.append(ref_txt)
-                    fallback_lang.append(self._resolve_alignment_language([pred_lang], resolved_language))
-                    fallback_offsets.append(c.offset_sec)
-
-                fallback_results: List[Any] = []
-                for a_chunk, t_chunk, l_chunk in zip(
-                    chunk_list(fallback_audio, self.max_inference_batch_size),
-                    chunk_list(fallback_text, self.max_inference_batch_size),
-                    chunk_list(fallback_lang, self.max_inference_batch_size),
-                ):
-                    fallback_results.extend(
-                        self.forced_aligner.align(audio=a_chunk, text=t_chunk, language=l_chunk)
-                    )
-
-                for offset_sec, result in zip(fallback_offsets, fallback_results):
-                    shifted = self._offset_align_result(result, offset_sec)
-                    out_aligns[i].append(shifted)
             else:
                 out_aligns[i].append(gt_aligned_result)
                 item_count = len(getattr(gt_aligned_result, "items", []) or [])
