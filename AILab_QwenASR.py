@@ -602,6 +602,45 @@ def _group_time_stamps(
     return groups
 
 
+def _group_time_stamps_by_guide(time_stamps, guide_groups):
+    if not time_stamps or not guide_groups:
+        return []
+
+    cuts = [float("-inf")]
+    for left, right in zip(guide_groups, guide_groups[1:]):
+        cuts.append((float(left["end"]) + float(right["start"])) * 0.5)
+    cuts.append(float("inf"))
+
+    grouped_items = [[] for _ in guide_groups]
+    guide_idx = 0
+    for item in time_stamps:
+        center = 0.5 * (float(item.start_time) + float(item.end_time))
+        while guide_idx + 1 < len(cuts) - 1 and center >= cuts[guide_idx + 1]:
+            guide_idx += 1
+        grouped_items[guide_idx].append(item)
+
+    groups = []
+    for guide, items in zip(guide_groups, grouped_items):
+        if not items:
+            continue
+        text = ""
+        for item in items:
+            token = (item.text or "").strip()
+            if not token:
+                continue
+            text = _join_tokens(text, token).strip()
+        if not text:
+            continue
+        groups.append(
+            {
+                "start": float(guide["start"]),
+                "end": float(guide["end"]),
+                "text": text,
+            }
+        )
+    return groups
+
+
 def _run_subtitle_transcription(
     audio,
     model="Qwen/Qwen3-ASR-0.6B",
@@ -684,16 +723,31 @@ def _run_subtitle_transcription(
     file_content = ""
     file_path = ""
     time_stamps = getattr(result, "time_stamps", None)
+    source_text = getattr(result, "source_text", None)
+    source_time_stamps = getattr(result, "source_time_stamps", None)
 
     if time_stamps and text:
         time_stamps = _align_punctuation_to_stamps(text, time_stamps)
 
-    groups = _group_time_stamps(
-        time_stamps,
-        max_gap_sec=max_gap_sec,
-        max_chars=max_chars,
-        split_mode=split_mode,
-    )
+    guide_groups = []
+    if gt_text and source_time_stamps and source_text:
+        source_stamps = _align_punctuation_to_stamps(source_text, source_time_stamps)
+        guide_groups = _group_time_stamps(
+            source_stamps,
+            max_gap_sec=max_gap_sec,
+            max_chars=max_chars,
+            split_mode=split_mode,
+        )
+
+    if guide_groups and time_stamps:
+        groups = _group_time_stamps_by_guide(time_stamps, guide_groups)
+    else:
+        groups = _group_time_stamps(
+            time_stamps,
+            max_gap_sec=max_gap_sec,
+            max_chars=max_chars,
+            split_mode=split_mode,
+        )
 
     if minimum_duration > 0:
         groups = [g for g in groups if (g["end"] - g["start"]) >= minimum_duration]

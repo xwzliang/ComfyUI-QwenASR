@@ -93,6 +93,8 @@ class ASRTranscription:
     language: str
     text: str
     time_stamps: Optional[Any] = None
+    source_text: Optional[str] = None
+    source_time_stamps: Optional[Any] = None
 
 
 @dataclass
@@ -600,6 +602,8 @@ class Qwen3ASRModel:
                     language=merged_language,
                     text=str(refs[i] or ""),
                     time_stamps=merged_align,
+                    source_text=getattr(asr_result, "text", None),
+                    source_time_stamps=getattr(asr_result, "time_stamps", None),
                 )
             )
 
