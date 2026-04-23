@@ -95,6 +95,7 @@ class ASRTranscription:
     time_stamps: Optional[Any] = None
     source_text: Optional[str] = None
     source_time_stamps: Optional[Any] = None
+    source_token_mapping: Optional[List[Optional[int]]] = None
 
 
 @dataclass
@@ -533,6 +534,7 @@ class Qwen3ASRModel:
 
         out_aligns: List[List[Any]] = [[] for _ in range(n)]
         out_langs: List[List[str]] = [[] for _ in range(n)]
+        out_source_mappings: List[Optional[List[Optional[int]]]] = [None] * n
 
         for i in range(n):
             asr_result = asr_results[i]
@@ -565,7 +567,7 @@ class Qwen3ASRModel:
                 items=asr_items,
             )
 
-            gt_aligned_result = self._align_reference_to_asr_timestamps(
+            gt_aligned_result, gt_mapping = self._align_reference_to_asr_timestamps(
                 reference_text=reference,
                 language=resolved_language,
                 asr_aligned_results=[asr_result.time_stamps],
@@ -578,6 +580,7 @@ class Qwen3ASRModel:
                 )
             else:
                 out_aligns[i].append(gt_aligned_result)
+                out_source_mappings[i] = gt_mapping
                 item_count = len(getattr(gt_aligned_result, "items", []) or [])
                 self._log_ground_truth_alignment(
                     "info",
@@ -597,13 +600,15 @@ class Qwen3ASRModel:
             if not merged_language:
                 merged_language = langs_norm[i] or ""
             merged_align = self._merge_align_results(out_aligns[i])
+            source_result = asr_results[i]
             results.append(
                 ASRTranscription(
                     language=merged_language,
                     text=str(refs[i] or ""),
                     time_stamps=merged_align,
-                    source_text=getattr(asr_result, "text", None),
-                    source_time_stamps=getattr(asr_result, "time_stamps", None),
+                    source_text=getattr(source_result, "text", None),
+                    source_time_stamps=getattr(source_result, "time_stamps", None),
+                    source_token_mapping=out_source_mappings[i],
                 )
             )
 
@@ -1417,11 +1422,11 @@ class Qwen3ASRModel:
         language: str,
         asr_aligned_results: List[Any],
         sample_idx: int,
-    ) -> Optional[Any]:
+    ) -> Tuple[Optional[Any], Optional[List[Optional[int]]]]:
         self._require_text_alignment_dependencies(language)
         merged_asr = self._merge_align_results(asr_aligned_results)
         if merged_asr is None or not getattr(merged_asr, "items", None):
-            return None
+            return (None, None)
 
         asr_items = list(merged_asr.items)
         gt_tokens = self._tokenize_ground_truth_with_original_text(reference_text, language)
@@ -1430,7 +1435,7 @@ class Qwen3ASRModel:
         self._log_token_alignment_debug(sample_idx, gt_tokens, asr_tokens, mapping)
         token_times = self._interpolate_ground_truth_token_times(gt_tokens, asr_tokens, mapping)
         result = self._build_result_from_token_times(gt_tokens, token_times, merged_asr)
-        return result
+        return (result, mapping)
 
     def _split_reference_text_by_chunks(
         self,

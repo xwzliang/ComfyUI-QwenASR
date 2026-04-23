@@ -70,6 +70,7 @@ SUPPORTED_LANGUAGES = [
 
 _ASR_MODEL_CACHE = {}
 _CONFIG_CACHE = {"mtime": None, "data": None}
+_SUBTITLE_STRIP_CHARS = "，。！？,.!?；;：:\"'“”‘’（）()【】[]《》〈〉「」『』…—- "
 
 
 def _default_config():
@@ -594,50 +595,163 @@ def _group_time_stamps(
     if cur is not None:
         groups.append(cur)
 
-    # Strip trailing punctuation and spaces from each finalized line
-    punct_to_remove = "".join(punct)
     for g in groups:
-        g["text"] = g["text"].rstrip(punct_to_remove)
+        g["text"] = g["text"].strip(_SUBTITLE_STRIP_CHARS)
 
     return groups
 
 
-def _group_time_stamps_by_guide(time_stamps, guide_groups):
-    if not time_stamps or not guide_groups:
+def _group_time_stamps_with_spans(
+    time_stamps, max_gap_sec: float, max_chars: int, split_mode: str
+):
+    if not time_stamps:
         return []
 
-    cuts = [float("-inf")]
-    for left, right in zip(guide_groups, guide_groups[1:]):
-        cuts.append((float(left["end"]) + float(right["start"])) * 0.5)
-    cuts.append(float("inf"))
+    groups = []
+    cur = None
+    punct = ("，", "。", "！", "？", ",", ".", "!", "?")
+    for idx, item in enumerate(time_stamps):
+        text = (item.text or "").strip()
+        if not text:
+            continue
+        if cur is None:
+            cur = {
+                "start": item.start_time,
+                "end": item.end_time,
+                "text": text,
+                "token_start": idx,
+                "token_end": idx + 1,
+            }
+            continue
+
+        center = 0.5 * (float(item.start_time) + float(item.end_time))
+        gap = float(item.start_time) - float(cur["end"])
+        too_far = gap > max_gap_sec
+        too_long = max_chars > 0 and (len(cur["text"]) + len(text)) > max_chars
+        end_sentence = any(cur["text"].endswith(p) for p in punct)
+
+        split_by_punct = split_mode in (
+            "split_by_punctuation",
+            "split_by_punctuation_or_length",
+            "split_by_punctuation_or_pause",
+            "split_by_punctuation_or_pause_or_length",
+        )
+        split_by_length = split_mode in (
+            "split_by_length",
+            "split_by_punctuation_or_length",
+            "split_by_punctuation_or_pause_or_length",
+        )
+        split_by_pause = split_mode in (
+            "split_by_pause",
+            "split_by_punctuation_or_pause",
+            "split_by_punctuation_or_pause_or_length",
+        )
+
+        should_split = False
+        if split_by_punct and end_sentence:
+            should_split = True
+        if split_by_length and too_long:
+            should_split = True
+        if split_by_pause and too_far:
+            should_split = True
+
+        if should_split:
+            groups.append(cur)
+            cur = {
+                "start": item.start_time,
+                "end": item.end_time,
+                "text": text,
+                "token_start": idx,
+                "token_end": idx + 1,
+            }
+        else:
+            cur["text"] = _join_tokens(cur["text"], text).strip()
+            cur["end"] = item.end_time
+            cur["token_end"] = idx + 1
+
+    if cur is not None:
+        groups.append(cur)
+
+    for g in groups:
+        g["text"] = g["text"].strip(_SUBTITLE_STRIP_CHARS)
+
+    return groups
+
+
+def _group_time_stamps_by_guide_mapping(
+    time_stamps,
+    guide_groups,
+    source_token_mapping,
+    max_gap_sec: float,
+    max_chars: int,
+    split_mode: str,
+):
+    if not time_stamps or not guide_groups or not source_token_mapping:
+        return []
+
+    token_to_group = {}
+    for group_idx, guide in enumerate(guide_groups):
+        for token_idx in range(int(guide["token_start"]), int(guide["token_end"])):
+            token_to_group[token_idx] = group_idx
+
+    assignments = [None] * len(time_stamps)
+    for idx in range(min(len(time_stamps), len(source_token_mapping))):
+        src_idx = source_token_mapping[idx]
+        if src_idx is None:
+            continue
+        group_idx = token_to_group.get(int(src_idx))
+        if group_idx is not None:
+            assignments[idx] = group_idx
+
+    matched = [idx for idx, group_idx in enumerate(assignments) if group_idx is not None]
+    if not matched:
+        return []
+
+    first = matched[0]
+    for idx in range(0, first):
+        assignments[idx] = assignments[first]
+
+    for left, right in zip(matched, matched[1:]):
+        left_group = int(assignments[left])
+        right_group = int(assignments[right])
+        if right_group < left_group:
+            right_group = left_group
+            assignments[right] = right_group
+        gap = right - left
+        for idx in range(left + 1, right):
+            if left_group == right_group:
+                assignments[idx] = left_group
+            else:
+                ratio = (idx - left) / float(gap)
+                group_idx = int(round(left_group + ((right_group - left_group) * ratio)))
+                assignments[idx] = max(left_group, min(group_idx, right_group))
+
+    last = matched[-1]
+    for idx in range(last + 1, len(assignments)):
+        assignments[idx] = assignments[last]
+
+    for idx in range(1, len(assignments)):
+        if assignments[idx] is None or assignments[idx] < assignments[idx - 1]:
+            assignments[idx] = assignments[idx - 1]
 
     grouped_items = [[] for _ in guide_groups]
-    guide_idx = 0
-    for item in time_stamps:
-        center = 0.5 * (float(item.start_time) + float(item.end_time))
-        while guide_idx + 1 < len(cuts) - 1 and center >= cuts[guide_idx + 1]:
-            guide_idx += 1
-        grouped_items[guide_idx].append(item)
+    for item, group_idx in zip(time_stamps, assignments):
+        if group_idx is None:
+            continue
+        grouped_items[int(group_idx)].append(item)
 
     groups = []
     for guide, items in zip(guide_groups, grouped_items):
         if not items:
             continue
-        text = ""
-        for item in items:
-            token = (item.text or "").strip()
-            if not token:
-                continue
-            text = _join_tokens(text, token).strip()
-        if not text:
-            continue
-        groups.append(
-            {
-                "start": float(guide["start"]),
-                "end": float(guide["end"]),
-                "text": text,
-            }
+        local_groups = _group_time_stamps(
+            items,
+            max_gap_sec=max_gap_sec,
+            max_chars=max_chars,
+            split_mode=split_mode,
         )
+        for g in local_groups:
+            groups.append(g)
     return groups
 
 
@@ -725,6 +839,7 @@ def _run_subtitle_transcription(
     time_stamps = getattr(result, "time_stamps", None)
     source_text = getattr(result, "source_text", None)
     source_time_stamps = getattr(result, "source_time_stamps", None)
+    source_token_mapping = getattr(result, "source_token_mapping", None)
 
     if time_stamps and text:
         time_stamps = _align_punctuation_to_stamps(text, time_stamps)
@@ -732,15 +847,29 @@ def _run_subtitle_transcription(
     guide_groups = []
     if gt_text and source_time_stamps and source_text:
         source_stamps = _align_punctuation_to_stamps(source_text, source_time_stamps)
-        guide_groups = _group_time_stamps(
+        guide_groups = _group_time_stamps_with_spans(
             source_stamps,
             max_gap_sec=max_gap_sec,
             max_chars=max_chars,
             split_mode=split_mode,
         )
 
-    if guide_groups and time_stamps:
-        groups = _group_time_stamps_by_guide(time_stamps, guide_groups)
+    if guide_groups and time_stamps and source_token_mapping:
+        groups = _group_time_stamps_by_guide_mapping(
+            time_stamps,
+            guide_groups,
+            source_token_mapping,
+            max_gap_sec=max_gap_sec,
+            max_chars=max_chars,
+            split_mode=split_mode,
+        )
+        if not groups:
+            groups = _group_time_stamps(
+                time_stamps,
+                max_gap_sec=max_gap_sec,
+                max_chars=max_chars,
+                split_mode=split_mode,
+            )
     else:
         groups = _group_time_stamps(
             time_stamps,
