@@ -70,7 +70,10 @@ SUPPORTED_LANGUAGES = [
 
 _ASR_MODEL_CACHE = {}
 _CONFIG_CACHE = {"mtime": None, "data": None}
-_SUBTITLE_STRIP_CHARS = "，。！？,.!?；;：:\"'“”‘’（）()【】[]《》〈〉「」『』…—- "
+_SUBTITLE_STRIP_CHARS = "，。！？、,.!?；;：:\"'“”‘’（）()【】[]《》〈〉「」『』…—- "
+_SUBTITLE_SPLIT_PUNCT = ("，", "。", "！", "？", "、", "；", "：", ",", ".", "!", "?", ";", ":", "…")
+_SUBTITLE_POST_PUNCT_CHARS = "\"'“”‘’（）()【】[]《》〈〉「」『』 \t\r\n"
+_SUBTITLE_INLINE_REMOVE_CHARS = "“”‘’「」『』"
 
 
 def _default_config():
@@ -479,6 +482,21 @@ def _join_tokens(a: str, b: str) -> str:
     return f"{a} {b}"
 
 
+def _ends_with_split_punct(text: str) -> bool:
+    if not text:
+        return False
+    return text.rstrip(_SUBTITLE_POST_PUNCT_CHARS).endswith(_SUBTITLE_SPLIT_PUNCT)
+
+
+def _clean_subtitle_text(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = str(text)
+    for ch in _SUBTITLE_INLINE_REMOVE_CHARS:
+        cleaned = cleaned.replace(ch, "")
+    return cleaned.strip(_SUBTITLE_STRIP_CHARS)
+
+
 class _AlignedStamp:
     """Mock object to hold aligned text and timestamps safely."""
 
@@ -493,7 +511,7 @@ def _align_punctuation_to_stamps(full_text: str, time_stamps: list) -> list:
     if not time_stamps or not full_text:
         return time_stamps
 
-    punct_chars = set("，。！？.,!?")
+    punct_chars = set("，。！？、；：,.!?;:…“”‘’\"'")
     aligned = []
     cursor = 0
 
@@ -538,7 +556,6 @@ def _group_time_stamps(
         return []
     groups = []
     cur = None
-    punct = ("，", "。", "！", "？", ",", ".", "!", "?")
     for item in time_stamps:
         text = (item.text or "").strip()
         if not text:
@@ -554,7 +571,7 @@ def _group_time_stamps(
         gap = float(item.start_time) - float(cur["end"])
         too_far = gap > max_gap_sec
         too_long = max_chars > 0 and (len(cur["text"]) + len(text)) > max_chars
-        end_sentence = any(cur["text"].endswith(p) for p in punct)
+        end_sentence = _ends_with_split_punct(cur["text"])
 
         split_by_punct = split_mode in (
             "split_by_punctuation",
@@ -596,7 +613,7 @@ def _group_time_stamps(
         groups.append(cur)
 
     for g in groups:
-        g["text"] = g["text"].strip(_SUBTITLE_STRIP_CHARS)
+        g["text"] = _clean_subtitle_text(g["text"])
 
     return groups
 
@@ -609,7 +626,6 @@ def _group_time_stamps_with_spans(
 
     groups = []
     cur = None
-    punct = ("，", "。", "！", "？", ",", ".", "!", "?")
     for idx, item in enumerate(time_stamps):
         text = (item.text or "").strip()
         if not text:
@@ -628,7 +644,7 @@ def _group_time_stamps_with_spans(
         gap = float(item.start_time) - float(cur["end"])
         too_far = gap > max_gap_sec
         too_long = max_chars > 0 and (len(cur["text"]) + len(text)) > max_chars
-        end_sentence = any(cur["text"].endswith(p) for p in punct)
+        end_sentence = _ends_with_split_punct(cur["text"])
 
         split_by_punct = split_mode in (
             "split_by_punctuation",
@@ -673,7 +689,7 @@ def _group_time_stamps_with_spans(
         groups.append(cur)
 
     for g in groups:
-        g["text"] = g["text"].strip(_SUBTITLE_STRIP_CHARS)
+        g["text"] = _clean_subtitle_text(g["text"])
 
     return groups
 
@@ -689,6 +705,18 @@ def _group_time_stamps_by_guide_mapping(
     if not time_stamps or not guide_groups or not source_token_mapping:
         return []
 
+    cuts = [float("-inf")]
+    for left, right in zip(guide_groups, guide_groups[1:]):
+        cuts.append((float(left["end"]) + float(right["start"])) * 0.5)
+    cuts.append(float("inf"))
+
+    def _time_group_for_item(item):
+        center = 0.5 * (float(item.start_time) + float(item.end_time))
+        for idx in range(len(guide_groups)):
+            if center < cuts[idx + 1]:
+                return idx
+        return len(guide_groups) - 1
+
     token_to_group = {}
     for group_idx, guide in enumerate(guide_groups):
         for token_idx in range(int(guide["token_start"]), int(guide["token_end"])):
@@ -702,6 +730,17 @@ def _group_time_stamps_by_guide_mapping(
         group_idx = token_to_group.get(int(src_idx))
         if group_idx is not None:
             assignments[idx] = group_idx
+
+    for idx, item in enumerate(time_stamps):
+        time_group = _time_group_for_item(item)
+        assigned_group = assignments[idx]
+        if assigned_group is None:
+            assignments[idx] = time_group
+            continue
+        guide = guide_groups[int(assigned_group)]
+        center = 0.5 * (float(item.start_time) + float(item.end_time))
+        if center < float(guide["start"]) or center > float(guide["end"]):
+            assignments[idx] = time_group
 
     matched = [idx for idx, group_idx in enumerate(assignments) if group_idx is not None]
     if not matched:
@@ -744,14 +783,22 @@ def _group_time_stamps_by_guide_mapping(
     for guide, items in zip(guide_groups, grouped_items):
         if not items:
             continue
-        local_groups = _group_time_stamps(
-            items,
-            max_gap_sec=max_gap_sec,
-            max_chars=max_chars,
-            split_mode=split_mode,
+        text = ""
+        for item in items:
+            token = (item.text or "").strip()
+            if not token:
+                continue
+            text = _join_tokens(text, token).strip()
+        text = _clean_subtitle_text(text)
+        if not text:
+            continue
+        groups.append(
+            {
+                "start": float(guide["start"]),
+                "end": float(guide["end"]),
+                "text": text,
+            }
         )
-        for g in local_groups:
-            groups.append(g)
     return groups
 
 
@@ -837,46 +884,26 @@ def _run_subtitle_transcription(
     file_content = ""
     file_path = ""
     time_stamps = getattr(result, "time_stamps", None)
-    source_text = getattr(result, "source_text", None)
-    source_time_stamps = getattr(result, "source_time_stamps", None)
-    source_token_mapping = getattr(result, "source_token_mapping", None)
 
     if time_stamps and text:
         time_stamps = _align_punctuation_to_stamps(text, time_stamps)
 
-    guide_groups = []
-    if gt_text and source_time_stamps and source_text:
-        source_stamps = _align_punctuation_to_stamps(source_text, source_time_stamps)
-        guide_groups = _group_time_stamps_with_spans(
-            source_stamps,
-            max_gap_sec=max_gap_sec,
-            max_chars=max_chars,
-            split_mode=split_mode,
-        )
+    effective_split_mode = split_mode
+    effective_max_gap_sec = max_gap_sec
+    effective_max_chars = max_chars
+    if gt_text:
+        # Ground-truth alignment should segment from GT punctuation directly
+        # instead of inheriting ASR subtitle buckets.
+        effective_split_mode = "split_by_punctuation"
+        effective_max_gap_sec = float("inf")
+        effective_max_chars = 0
 
-    if guide_groups and time_stamps and source_token_mapping:
-        groups = _group_time_stamps_by_guide_mapping(
-            time_stamps,
-            guide_groups,
-            source_token_mapping,
-            max_gap_sec=max_gap_sec,
-            max_chars=max_chars,
-            split_mode=split_mode,
-        )
-        if not groups:
-            groups = _group_time_stamps(
-                time_stamps,
-                max_gap_sec=max_gap_sec,
-                max_chars=max_chars,
-                split_mode=split_mode,
-            )
-    else:
-        groups = _group_time_stamps(
-            time_stamps,
-            max_gap_sec=max_gap_sec,
-            max_chars=max_chars,
-            split_mode=split_mode,
-        )
+    groups = _group_time_stamps(
+        time_stamps,
+        max_gap_sec=effective_max_gap_sec,
+        max_chars=effective_max_chars,
+        split_mode=effective_split_mode,
+    )
 
     if minimum_duration > 0:
         groups = [g for g in groups if (g["end"] - g["start"]) >= minimum_duration]
