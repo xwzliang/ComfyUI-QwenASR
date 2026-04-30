@@ -72,7 +72,7 @@ logger = logging.getLogger(__name__)
 
 _PUNCT_OR_SPACE_RE = re.compile(r"[\W_]+", re.UNICODE)
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
-TIMESTAMP_ASR_CHUNK_SECONDS = 45.0
+TIMESTAMP_ASR_CHUNK_SECONDS = 20.0
 
 
 @dataclass
@@ -449,6 +449,25 @@ class Qwen3ASRModel:
             for k, idx in enumerate(to_align_idx):
                 c = chunks[idx]
                 r = aligned_results[k]
+                lang_pred = per_chunk_lang[idx]
+                txt = per_chunk_text[idx]
+
+                repaired_tokens = self._normalize_timed_items_for_compare(list(getattr(r, "items", []) or []), lang_pred)
+                repaired_tokens = self._repair_asr_token_times_by_sentence(
+                    asr_text=txt,
+                    language=lang_pred,
+                    asr_tokens=repaired_tokens,
+                    sample_idx=c.orig_index,
+                )
+                r = self._build_result_from_asr_tokens(repaired_tokens, r)
+                r = self._refine_align_result_by_segments(
+                    audio_wav=c.wav,
+                    text=txt,
+                    language=lang_pred,
+                    initial_result=r,
+                    sample_idx=c.orig_index,
+                    chunk_idx=c.chunk_index,
+                )
                 per_chunk_align[idx] = self._offset_align_result(r, c.offset_sec)
 
         # merge chunks back to original samples
@@ -951,6 +970,49 @@ class Qwen3ASRModel:
             cursor = end
         return sentences
 
+    def _split_text_into_alignment_refine_segments(
+        self,
+        text: str,
+        language: str,
+    ) -> List[Dict[str, Any]]:
+        raw_text = str(text or "").strip()
+        if not raw_text:
+            return []
+
+        terminators = set("。！？!?；;…，,：:\n")
+        parts: List[str] = []
+        current: List[str] = []
+        for ch in raw_text:
+            current.append(ch)
+            if ch in terminators:
+                part = "".join(current).strip()
+                if part:
+                    parts.append(part)
+                current = []
+        if current:
+            part = "".join(current).strip()
+            if part:
+                parts.append(part)
+
+        segments: List[Dict[str, Any]] = []
+        cursor = 0
+        for part in parts:
+            tokens = self._tokenize_alignment_text(part, language)
+            if not tokens:
+                continue
+            start = cursor
+            end = start + len(tokens)
+            segments.append(
+                {
+                    "text": part,
+                    "tokens": tokens,
+                    "start": start,
+                    "end": end,
+                }
+            )
+            cursor = end
+        return segments
+
     def _find_high_confidence_sentence_anchor(
         self,
         predicted_text: str,
@@ -1267,6 +1329,7 @@ class Qwen3ASRModel:
             span = end - start
             if span < 4:
                 continue
+            refine_segments = self._split_text_into_alignment_refine_segments(sentence["text"], language)
 
             gaps = [
                 float(repaired[idx + 1]["start_time"]) - float(repaired[idx]["end_time"])
@@ -1363,6 +1426,94 @@ class Qwen3ASRModel:
                     f"text='{self._preview_text(sentence['text'], limit=64)}'.",
                 )
                 break
+
+            # Repair a large internal gap by shifting the whole suffix cluster earlier
+            # while keeping relative timings inside the suffix unchanged.
+            gaps = [
+                float(repaired[idx + 1]["start_time"]) - float(repaired[idx]["end_time"])
+                for idx in range(start, end - 1)
+            ]
+            if not gaps:
+                continue
+
+            max_rel_idx = int(np.argmax(gaps))
+            max_gap = float(gaps[max_rel_idx])
+            prefix_count = max_rel_idx + 1
+            suffix_count = span - prefix_count
+            if (
+                max_gap > large_gap_threshold
+                and prefix_count >= 2
+                and suffix_count >= 2
+            ):
+                target_gap = min(max(typical_gap * 2.0, 0.18), 0.6)
+                shift = max_gap - target_gap
+                if shift > 0.0:
+                    boundary_segment_idx = next(
+                        (
+                            idx
+                            for idx, seg in enumerate(refine_segments)
+                            if int(seg["end"]) == prefix_count
+                        ),
+                        None,
+                    )
+                    if boundary_segment_idx is not None and boundary_segment_idx + 1 < len(refine_segments):
+                        next_segment = refine_segments[boundary_segment_idx + 1]
+                        next_start_idx = start + int(next_segment["start"])
+                        next_end_idx = min(end, start + int(next_segment["end"]))
+                        next_count = max(0, next_end_idx - next_start_idx)
+                        next_span = 0.0
+                        next_unit = 0.0
+                        if next_count > 0:
+                            next_span = (
+                                float(repaired[next_end_idx - 1]["end_time"])
+                                - float(repaired[next_start_idx]["start_time"])
+                            )
+                            next_unit = next_span / float(next_count)
+
+                        if next_count >= 4 and next_unit < 0.18:
+                            for token_idx in range(next_start_idx, next_end_idx):
+                                new_start = float(repaired[token_idx]["start_time"]) - shift
+                                new_end = float(repaired[token_idx]["end_time"]) - shift
+                                repaired[token_idx]["start_time"] = round(new_start, 3)
+                                repaired[token_idx]["end_time"] = round(max(new_end, new_start + 0.001), 3)
+
+                            self._log_ground_truth_alignment(
+                                "info",
+                                f"sample={sample_idx} asr_sentence_repair={sentence_idx} type=middle_gap_segment "
+                                f"token_span={start}:{end} split_at={start + max_rel_idx} gap={round(max_gap, 3)} "
+                                f"threshold={round(large_gap_threshold, 3)} shift={round(shift, 3)} "
+                                f"target_gap={round(target_gap, 3)} next_segment={next_start_idx}:{next_end_idx} "
+                                f"next_unit={round(next_unit, 3)} "
+                                f"text='{self._preview_text(sentence['text'], limit=64)}'.",
+                            )
+                            continue
+
+                        if next_count >= 4 and next_unit >= 0.18:
+                            self._log_ground_truth_alignment(
+                                "info",
+                                f"sample={sample_idx} asr_sentence_repair={sentence_idx} type=middle_gap_skip_segment "
+                                f"token_span={start}:{end} split_at={start + max_rel_idx} gap={round(max_gap, 3)} "
+                                f"threshold={round(large_gap_threshold, 3)} next_segment={next_start_idx}:{next_end_idx} "
+                                f"next_unit={round(next_unit, 3)} "
+                                f"text='{self._preview_text(sentence['text'], limit=64)}'.",
+                            )
+                            continue
+
+                    suffix_start_idx = start + prefix_count
+                    for token_idx in range(suffix_start_idx, end):
+                        new_start = float(repaired[token_idx]["start_time"]) - shift
+                        new_end = float(repaired[token_idx]["end_time"]) - shift
+                        repaired[token_idx]["start_time"] = round(new_start, 3)
+                        repaired[token_idx]["end_time"] = round(max(new_end, new_start + 0.001), 3)
+
+                    self._log_ground_truth_alignment(
+                        "info",
+                        f"sample={sample_idx} asr_sentence_repair={sentence_idx} type=middle_gap_suffix "
+                        f"token_span={start}:{end} split_at={start + max_rel_idx} gap={round(max_gap, 3)} "
+                        f"threshold={round(large_gap_threshold, 3)} shift={round(shift, 3)} "
+                        f"target_gap={round(target_gap, 3)} "
+                        f"text='{self._preview_text(sentence['text'], limit=64)}'.",
+                    )
 
         return repaired
 
@@ -1541,6 +1692,192 @@ class Qwen3ASRModel:
                 )
             )
         return type(prototype_result)(items=items)
+
+    def _build_result_from_asr_tokens(
+        self,
+        asr_tokens: List[Dict[str, Any]],
+        prototype_result: Any,
+    ) -> Any:
+        if prototype_result is None:
+            return None
+        item_type = type(prototype_result.items[0]) if getattr(prototype_result, "items", None) else None
+        if item_type is None:
+            return type(prototype_result)(items=[])
+        items = []
+        for token in asr_tokens:
+            items.append(
+                item_type(
+                    text=str(token.get("text", "") or ""),
+                    start_time=round(float(token.get("start_time", 0.0)), 3),
+                    end_time=round(float(token.get("end_time", 0.0)), 3),
+                )
+            )
+        return type(prototype_result)(items=items)
+
+    def _refine_align_result_by_segments(
+        self,
+        audio_wav: np.ndarray,
+        text: str,
+        language: str,
+        initial_result: Any,
+        sample_idx: int,
+        chunk_idx: int,
+    ) -> Any:
+        if self.forced_aligner is None or initial_result is None or not text:
+            return initial_result
+
+        initial_items = list(getattr(initial_result, "items", []) or [])
+        if not initial_items:
+            return initial_result
+
+        segments = self._split_text_into_alignment_refine_segments(text, language)
+        if len(segments) <= 1:
+            return initial_result
+
+        item_count = len(initial_items)
+        audio_sec = len(np.asarray(audio_wav)) / float(SAMPLE_RATE)
+        if audio_sec <= 0.0:
+            return initial_result
+
+        segment_results: List[Any] = []
+        padding_sec = 0.16
+
+        for segment_idx, segment in enumerate(segments):
+            start = max(0, min(int(segment["start"]), item_count - 1))
+            end = max(start + 1, min(int(segment["end"]), item_count))
+            coarse_items = initial_items[start:end]
+            if not coarse_items:
+                continue
+
+            segment_token_count = max(1, end - start)
+            coarse_start = float(coarse_items[0].start_time)
+            coarse_end = float(coarse_items[-1].end_time)
+            coarse_span = coarse_end - coarse_start
+            coarse_unit_span = coarse_span / float(segment_token_count)
+            prev_end = None if start == 0 else float(initial_items[start - 1].end_time)
+            next_start = None if end >= item_count else float(initial_items[end].start_time)
+            prev_gap = None if prev_end is None else coarse_start - prev_end
+            next_gap = None if next_start is None else next_start - coarse_end
+
+            left_boundary = 0.0 if prev_end is None else 0.5 * (prev_end + coarse_start)
+            right_boundary = audio_sec if next_start is None else 0.5 * (coarse_end + next_start)
+
+            # If the coarse alignment created a very large internal gap before or after
+            # this punctuation-delimited segment, keep the refine window wide enough to
+            # search across that gap instead of locking the segment to its late edge.
+            gap_expand_threshold = 1.0
+            compressed_segment = segment_token_count >= 4 and coarse_unit_span < 0.11
+            if (
+                compressed_segment
+                and prev_end is not None
+                and prev_gap is not None
+                and prev_gap > gap_expand_threshold
+            ):
+                left_boundary = max(0.0, prev_end)
+            if (
+                compressed_segment
+                and next_start is not None
+                and next_gap is not None
+                and next_gap > gap_expand_threshold
+            ):
+                right_boundary = min(audio_sec, next_start)
+
+            local_start = max(0.0, left_boundary - padding_sec)
+            local_end = min(audio_sec, right_boundary + padding_sec)
+
+            if local_end - local_start < 0.12:
+                segment_results.append(type(initial_result)(items=coarse_items))
+                continue
+
+            start_sample = max(0, int(np.floor(local_start * SAMPLE_RATE)))
+            end_sample = min(len(audio_wav), int(np.ceil(local_end * SAMPLE_RATE)))
+            if end_sample - start_sample < max(16, int(0.12 * SAMPLE_RATE)):
+                segment_results.append(type(initial_result)(items=coarse_items))
+                continue
+
+            refined = self.forced_aligner.align(
+                audio=[(np.asarray(audio_wav[start_sample:end_sample], dtype=np.float32), SAMPLE_RATE)],
+                text=[segment["text"]],
+                language=[language],
+            )[0]
+            refined_items = list(getattr(refined, "items", []) or [])
+            if len(refined_items) != (end - start):
+                segment_results.append(type(initial_result)(items=coarse_items))
+                continue
+
+            refined = self._offset_align_result(refined, local_start)
+            refined_start = float(refined_items[0].start_time) + local_start
+            refined_end = float(refined_items[-1].end_time) + local_start
+            refined_span = refined_end - refined_start
+            previous_selected_end = None
+            if segment_results:
+                previous_items = list(getattr(segment_results[-1], "items", []) or [])
+                if previous_items:
+                    previous_selected_end = float(previous_items[-1].end_time)
+
+            coarse_overlaps_previous = (
+                previous_selected_end is not None and coarse_start < (previous_selected_end - 0.04)
+            )
+            refined_resolves_previous = (
+                previous_selected_end is None or refined_start >= (previous_selected_end - 0.04)
+            )
+            allow_large_shift_to_resolve_overlap = (
+                not compressed_segment
+                and coarse_overlaps_previous
+                and refined_resolves_previous
+                and refined_start > coarse_start
+            )
+            suspicious_refine = (
+                not compressed_segment
+                and (
+                    abs(refined_start - coarse_start) > 1.0
+                    or abs(refined_end - coarse_end) > 1.0
+                    or refined_span > max(coarse_span * 2.5, coarse_span + 1.0)
+                )
+            )
+            if allow_large_shift_to_resolve_overlap:
+                suspicious_refine = False
+            if suspicious_refine:
+                segment_results.append(type(initial_result)(items=coarse_items))
+                self._log_ground_truth_alignment(
+                    "info",
+                    f"sample={sample_idx} asr_refine_chunk={chunk_idx} segment={segment_idx} "
+                    f"type=fallback_to_coarse coarse={round(coarse_start, 3)}-{round(coarse_end, 3)} "
+                    f"refined={round(refined_start, 3)}-{round(refined_end, 3)} "
+                    f"coarse_span={round(coarse_span, 3)} refined_span={round(refined_span, 3)} "
+                    f"compressed={compressed_segment} prev_gap={'n/a' if prev_gap is None else round(prev_gap, 3)} "
+                    f"next_gap={'n/a' if next_gap is None else round(next_gap, 3)} "
+                    f"prev_selected_end={'n/a' if previous_selected_end is None else round(previous_selected_end, 3)} "
+                    f"text='{self._preview_text(segment['text'], limit=64)}'.",
+                )
+                continue
+
+            segment_results.append(refined)
+            if (
+                abs(refined_start - coarse_start) > 0.3
+                or abs(refined_end - coarse_end) > 0.3
+                or (compressed_segment and prev_gap is not None and prev_gap > gap_expand_threshold)
+                or (compressed_segment and next_gap is not None and next_gap > gap_expand_threshold)
+            ):
+                self._log_ground_truth_alignment(
+                    "info",
+                    f"sample={sample_idx} asr_refine_chunk={chunk_idx} segment={segment_idx} "
+                    f"tokens={start}:{end} coarse={round(coarse_start, 3)}-{round(coarse_end, 3)} "
+                    f"refined={round(refined_start, 3)}-{round(refined_end, 3)} "
+                    f"coarse_span={round(coarse_span, 3)} refined_span={round(refined_span, 3)} "
+                    f"compressed={compressed_segment} "
+                    f"prev_gap={'n/a' if prev_gap is None else round(prev_gap, 3)} "
+                    f"next_gap={'n/a' if next_gap is None else round(next_gap, 3)} "
+                    f"prev_selected_end={'n/a' if previous_selected_end is None else round(previous_selected_end, 3)} "
+                    f"overlap_repair={allow_large_shift_to_resolve_overlap} "
+                    f"window={round(local_start, 3)}-{round(local_end, 3)} "
+                    f"text='{self._preview_text(segment['text'], limit=64)}'.",
+                )
+
+        if not segment_results:
+            return initial_result
+        merged = self._merge_align_results(segment_results)
+        return merged if merged is not None else initial_result
 
     def _log_token_alignment_debug(
         self,

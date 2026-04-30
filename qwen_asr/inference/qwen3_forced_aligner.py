@@ -17,6 +17,7 @@ import os
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
+import numpy as np
 
 import nagisa
 import torch
@@ -233,6 +234,81 @@ class Qwen3ForceAlignProcessor():
 
         return [int(res) for res in result]
 
+    def repair_large_endpoint_gaps(self, timestamp_fixed: List[int]) -> List[int]:
+        if not timestamp_fixed:
+            return timestamp_fixed
+
+        data = [int(x) for x in timestamp_fixed]
+        token_count = len(data) // 2
+        if token_count < 4:
+            return data
+
+        starts = [data[i * 2] for i in range(token_count)]
+        ends = [data[i * 2 + 1] for i in range(token_count)]
+        gaps = [starts[i + 1] - ends[i] for i in range(token_count - 1)]
+        positive_gaps = [gap for gap in gaps if gap > 0]
+        if not positive_gaps:
+            return data
+
+        typical_gap = float(np.median(positive_gaps))
+        large_gap_threshold = max(2000.0, typical_gap * 8.0)
+
+        def _median_unit(left: int, right: int) -> float:
+            durations = [
+                max(40.0, min(400.0, float(ends[idx] - starts[idx])))
+                for idx in range(max(0, left), min(token_count, right))
+            ]
+            if not durations:
+                return 120.0
+            unit = float(np.median(durations))
+            return min(max(unit, 80.0), 240.0)
+
+        head_limit = min(2, len(gaps))
+        for rel_idx in range(head_limit):
+            gap = gaps[rel_idx]
+            prefix_count = rel_idx + 1
+            suffix_count = token_count - prefix_count
+            if gap <= large_gap_threshold or prefix_count > 2 or suffix_count < 4:
+                continue
+
+            unit = _median_unit(prefix_count, min(token_count, prefix_count + 5))
+            cluster_start = float(starts[prefix_count])
+            total_span = unit * prefix_count
+            new_start = max(0.0, cluster_start - total_span)
+            step = total_span / prefix_count
+            for local_idx in range(prefix_count):
+                token_idx = local_idx
+                seg_start = new_start + (step * local_idx)
+                seg_end = cluster_start if local_idx == prefix_count - 1 else new_start + (step * (local_idx + 1))
+                data[token_idx * 2] = int(round(seg_start))
+                data[token_idx * 2 + 1] = int(round(max(seg_end, seg_start + 1.0)))
+            break
+
+        starts = [data[i * 2] for i in range(token_count)]
+        ends = [data[i * 2 + 1] for i in range(token_count)]
+        gaps = [starts[i + 1] - ends[i] for i in range(token_count - 1)]
+        tail_limit_start = max(0, len(gaps) - 2)
+        for rel_idx in range(len(gaps) - 1, tail_limit_start - 1, -1):
+            gap = gaps[rel_idx]
+            prefix_count = rel_idx + 1
+            suffix_count = token_count - prefix_count
+            if gap <= large_gap_threshold or suffix_count > 2 or prefix_count < 4:
+                continue
+
+            unit = _median_unit(max(0, prefix_count - 5), prefix_count)
+            cluster_end = float(ends[prefix_count - 1])
+            total_span = unit * suffix_count
+            step = total_span / suffix_count
+            for local_idx in range(suffix_count):
+                token_idx = prefix_count + local_idx
+                seg_start = cluster_end + (step * local_idx)
+                seg_end = cluster_end + (step * (local_idx + 1))
+                data[token_idx * 2] = int(round(seg_start))
+                data[token_idx * 2 + 1] = int(round(max(seg_end, seg_start + 1.0)))
+            break
+
+        return data
+
     def encode_timestamp(self, text: str, language: str) -> List[str]:
         language = language.lower()
 
@@ -255,6 +331,7 @@ class Qwen3ForceAlignProcessor():
         timestamp_output = []
 
         timestamp_fixed = self.fix_timestamp(timestamp)
+        timestamp_fixed = self.repair_large_endpoint_gaps(timestamp_fixed)
         for i, word in enumerate(word_list):
             start_time = timestamp_fixed[i * 2]
             end_time = timestamp_fixed[i * 2 + 1]
