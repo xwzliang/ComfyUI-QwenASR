@@ -694,6 +694,58 @@ def _group_time_stamps_with_spans(
     return groups
 
 
+def _snap_groups_to_source_token_times(groups, source_time_stamps, source_token_mapping):
+    if not groups or source_time_stamps is None or not source_token_mapping:
+        return groups
+
+    source_items = list(getattr(source_time_stamps, "items", []) or [])
+    if not source_items:
+        return groups
+
+    snapped = []
+    prev_end = None
+    mapping_len = len(source_token_mapping)
+    source_len = len(source_items)
+
+    for group in groups:
+        token_start = int(group.get("token_start", 0))
+        token_end = int(group.get("token_end", token_start))
+        mapped_indices = []
+        upper = min(token_end, mapping_len)
+        for idx in range(max(0, token_start), upper):
+            source_idx = source_token_mapping[idx]
+            if source_idx is None:
+                continue
+            source_idx = int(source_idx)
+            if 0 <= source_idx < source_len:
+                mapped_indices.append(source_idx)
+
+        start = float(group["start"])
+        end = float(group["end"])
+        if mapped_indices:
+            first_idx = mapped_indices[0]
+            last_idx = mapped_indices[-1]
+            start = float(source_items[first_idx].start_time)
+            end = float(source_items[last_idx].end_time)
+
+        if prev_end is not None and start < prev_end:
+            start = prev_end
+        if end <= start:
+            fallback_end = float(group["end"])
+            end = fallback_end if fallback_end > start else (start + 0.001)
+
+        snapped.append(
+            {
+                **group,
+                "start": start,
+                "end": end,
+            }
+        )
+        prev_end = end
+
+    return snapped
+
+
 def _group_time_stamps_by_guide_mapping(
     time_stamps,
     guide_groups,
@@ -884,7 +936,6 @@ def _run_subtitle_transcription(
     file_content = ""
     file_path = ""
     time_stamps = getattr(result, "time_stamps", None)
-
     if time_stamps and text:
         time_stamps = _align_punctuation_to_stamps(text, time_stamps)
 
@@ -898,12 +949,20 @@ def _run_subtitle_transcription(
         effective_max_gap_sec = float("inf")
         effective_max_chars = 0
 
-    groups = _group_time_stamps(
-        time_stamps,
-        max_gap_sec=effective_max_gap_sec,
-        max_chars=effective_max_chars,
-        split_mode=effective_split_mode,
-    )
+    if gt_text:
+        groups = _group_time_stamps_with_spans(
+            time_stamps,
+            max_gap_sec=effective_max_gap_sec,
+            max_chars=effective_max_chars,
+            split_mode=effective_split_mode,
+        )
+    else:
+        groups = _group_time_stamps(
+            time_stamps,
+            max_gap_sec=effective_max_gap_sec,
+            max_chars=effective_max_chars,
+            split_mode=effective_split_mode,
+        )
 
     if minimum_duration > 0:
         groups = [g for g in groups if (g["end"] - g["start"]) >= minimum_duration]

@@ -572,6 +572,7 @@ class Qwen3ASRModel:
                 language=resolved_language,
                 asr_aligned_results=[asr_result.time_stamps],
                 sample_idx=i,
+                asr_text=asr_result.text,
             )
             if gt_aligned_result is None:
                 self._log_ground_truth_alignment(
@@ -1238,6 +1239,133 @@ class Qwen3ASRModel:
             )
         return normalized
 
+    def _repair_asr_token_times_by_sentence(
+        self,
+        asr_text: str,
+        language: str,
+        asr_tokens: List[Dict[str, Any]],
+        sample_idx: int,
+    ) -> List[Dict[str, Any]]:
+        if not asr_text or not asr_tokens:
+            return asr_tokens
+
+        sentences = self._split_text_into_alignment_sentences(asr_text, language)
+        if not sentences:
+            return asr_tokens
+
+        repaired = [dict(token) for token in asr_tokens]
+
+        def _clamp_unit_duration(values: List[float]) -> float:
+            if not values:
+                return 0.12
+            unit = float(np.median(values))
+            return min(max(unit, 0.08), 0.24)
+
+        for sentence_idx, sentence in enumerate(sentences):
+            start = max(0, int(sentence["start"]))
+            end = min(len(repaired), int(sentence["end"]))
+            span = end - start
+            if span < 4:
+                continue
+
+            gaps = [
+                float(repaired[idx + 1]["start_time"]) - float(repaired[idx]["end_time"])
+                for idx in range(start, end - 1)
+            ]
+            positive_gaps = [gap for gap in gaps if gap > 0.0]
+            if not positive_gaps:
+                continue
+
+            typical_gap = float(np.median(positive_gaps))
+            large_gap_threshold = max(2.0, typical_gap * 8.0)
+
+            head_limit = min(2, len(gaps))
+            for rel_idx in range(head_limit):
+                gap = gaps[rel_idx]
+                prefix_count = rel_idx + 1
+                suffix_count = span - prefix_count
+                if gap <= large_gap_threshold or prefix_count > 2 or suffix_count < 4:
+                    continue
+
+                probe_end = min(end, start + prefix_count + 5)
+                ref_durations = [
+                    max(
+                        0.04,
+                        min(
+                            0.4,
+                            float(repaired[idx]["end_time"]) - float(repaired[idx]["start_time"]),
+                        ),
+                    )
+                    for idx in range(start + prefix_count, probe_end)
+                ]
+                unit = _clamp_unit_duration(ref_durations)
+                cluster_start = float(repaired[start + prefix_count]["start_time"])
+                total_span = unit * prefix_count
+                new_start = max(0.0, cluster_start - total_span)
+                step = total_span / prefix_count
+
+                for local_idx in range(prefix_count):
+                    token_idx = start + local_idx
+                    seg_start = new_start + (step * local_idx)
+                    seg_end = cluster_start if local_idx == prefix_count - 1 else new_start + (step * (local_idx + 1))
+                    repaired[token_idx]["start_time"] = round(seg_start, 3)
+                    repaired[token_idx]["end_time"] = round(max(seg_end, seg_start + 0.001), 3)
+
+                self._log_ground_truth_alignment(
+                    "info",
+                    f"sample={sample_idx} asr_sentence_repair={sentence_idx} type=head_outlier "
+                    f"token_span={start}:{end} moved_prefix={prefix_count} gap={round(gap, 3)} "
+                    f"threshold={round(large_gap_threshold, 3)} "
+                    f"new_range={round(float(repaired[start]['start_time']), 3)}-"
+                    f"{round(float(repaired[start + prefix_count - 1]['end_time']), 3)} "
+                    f"text='{self._preview_text(sentence['text'], limit=64)}'.",
+                )
+                break
+
+            tail_limit_start = max(0, len(gaps) - 2)
+            for rel_idx in range(len(gaps) - 1, tail_limit_start - 1, -1):
+                gap = gaps[rel_idx]
+                prefix_count = rel_idx + 1
+                suffix_count = span - prefix_count
+                if gap <= large_gap_threshold or suffix_count > 2 or prefix_count < 4:
+                    continue
+
+                probe_start = max(start, end - suffix_count - 4)
+                ref_durations = [
+                    max(
+                        0.04,
+                        min(
+                            0.4,
+                            float(repaired[idx]["end_time"]) - float(repaired[idx]["start_time"]),
+                        ),
+                    )
+                    for idx in range(probe_start, start + prefix_count)
+                ]
+                unit = _clamp_unit_duration(ref_durations)
+                cluster_end = float(repaired[start + prefix_count - 1]["end_time"])
+                total_span = unit * suffix_count
+                step = total_span / suffix_count
+
+                for local_idx in range(suffix_count):
+                    token_idx = start + prefix_count + local_idx
+                    seg_start = cluster_end + (step * local_idx)
+                    seg_end = cluster_end + (step * (local_idx + 1))
+                    repaired[token_idx]["start_time"] = round(seg_start, 3)
+                    repaired[token_idx]["end_time"] = round(max(seg_end, seg_start + 0.001), 3)
+
+                self._log_ground_truth_alignment(
+                    "info",
+                    f"sample={sample_idx} asr_sentence_repair={sentence_idx} type=tail_outlier "
+                    f"token_span={start}:{end} moved_suffix={suffix_count} gap={round(gap, 3)} "
+                    f"threshold={round(large_gap_threshold, 3)} "
+                    f"new_range={round(float(repaired[start + prefix_count]['start_time']), 3)}-"
+                    f"{round(float(repaired[end - 1]['end_time']), 3)} "
+                    f"text='{self._preview_text(sentence['text'], limit=64)}'.",
+                )
+                break
+
+        return repaired
+
     def _global_align_token_sequences(
         self,
         gt_tokens: List[Dict[str, str]],
@@ -1314,68 +1442,81 @@ class Qwen3ASRModel:
         if total_end <= total_start:
             total_end = total_start + (0.01 * len(gt_tokens))
 
-        centers: List[Optional[float]] = [None] * len(gt_tokens)
-
+        min_step = 0.001
+        token_times: List[Optional[Tuple[float, float]]] = [None] * len(gt_tokens)
+        gt_indices_by_asr_idx: Dict[int, List[int]] = {}
         for idx, asr_idx in enumerate(mapping):
             if asr_idx is None:
                 continue
-            token = asr_tokens[asr_idx]
-            centers[idx] = 0.5 * (token["start_time"] + token["end_time"])
+            gt_indices_by_asr_idx.setdefault(int(asr_idx), []).append(idx)
 
-        matched = [idx for idx, asr_idx in enumerate(mapping) if asr_idx is not None]
+        for asr_idx, gt_indices in gt_indices_by_asr_idx.items():
+            token = asr_tokens[asr_idx]
+            token_start = float(token["start_time"])
+            token_end = float(token["end_time"])
+            token_span = max(min_step, token_end - token_start)
+            count = max(1, len(gt_indices))
+            for pos, gt_idx in enumerate(gt_indices):
+                seg_start = token_start + (token_span * (pos / count))
+                seg_end = token_start + (token_span * ((pos + 1) / count))
+                token_times[gt_idx] = (
+                    round(seg_start, 3),
+                    round(max(seg_end, seg_start + min_step), 3),
+                )
+
+        matched = [idx for idx, item in enumerate(token_times) if item is not None]
         if not matched:
             span = total_end - total_start
             if len(gt_tokens) == 1:
                 return [(round(total_start, 3), round(total_end, 3))]
-            centers = [
-                total_start + (span * ((idx + 0.5) / len(gt_tokens)))
-                for idx in range(len(gt_tokens))
-            ]
-        else:
-            first = matched[0]
-            first_center = float(centers[first])
-            for idx in range(first - 1, -1, -1):
-                ratio = (idx + 1) / float(first + 1)
-                centers[idx] = total_start + ((first_center - total_start) * ratio)
+            step = span / max(1, len(gt_tokens))
+            out_times: List[Tuple[float, float]] = []
+            for idx in range(len(gt_tokens)):
+                start_time = total_start + (step * idx)
+                end_time = total_end if idx == len(gt_tokens) - 1 else total_start + (step * (idx + 1))
+                out_times.append((round(start_time, 3), round(max(end_time, start_time + min_step), 3)))
+            return out_times
 
-            last = matched[-1]
-            last_center = float(centers[last])
-            suffix_span = len(gt_tokens) - last
-            for idx in range(last + 1, len(gt_tokens)):
-                ratio = (idx - last) / float(max(1, suffix_span))
-                centers[idx] = last_center + ((total_end - last_center) * ratio)
+        def _fill_evenly(left_idx: int, right_idx: int, start_time: float, end_time: float) -> None:
+            count = right_idx - left_idx + 1
+            if count <= 0:
+                return
+            if end_time <= start_time:
+                end_time = start_time + (count * min_step)
+            step = (end_time - start_time) / count
+            for local_idx, gt_idx in enumerate(range(left_idx, right_idx + 1)):
+                seg_start = start_time + (step * local_idx)
+                seg_end = end_time if gt_idx == right_idx else start_time + (step * (local_idx + 1))
+                token_times[gt_idx] = (
+                    round(seg_start, 3),
+                    round(max(seg_end, seg_start + min_step), 3),
+                )
 
-            for left, right in zip(matched, matched[1:]):
-                if right - left <= 1:
-                    continue
-                left_center = float(centers[left])
-                right_center = float(centers[right])
-                span = right - left
-                for idx in range(left + 1, right):
-                    ratio = (idx - left) / span
-                    centers[idx] = left_center + ((right_center - left_center) * ratio)
+        first = matched[0]
+        if first > 0:
+            first_start = float(token_times[first][0])
+            _fill_evenly(0, first - 1, total_start, first_start)
 
-        concrete_centers = [float(c) if c is not None else total_start for c in centers]
-        boundaries: List[float] = [total_start]
-        for idx in range(1, len(concrete_centers)):
-            boundaries.append(0.5 * (concrete_centers[idx - 1] + concrete_centers[idx]))
-        boundaries.append(total_end)
+        for left, right in zip(matched, matched[1:]):
+            if right - left <= 1:
+                continue
+            left_end = float(token_times[left][1])
+            right_start = float(token_times[right][0])
+            _fill_evenly(left + 1, right - 1, left_end, right_start)
 
-        min_step = 0.001
-        max_boundary = total_end
-        for idx in range(len(boundaries) - 1, -1, -1):
-            lower_bound = total_start + (min_step * idx)
-            upper_bound = max_boundary
-            boundaries[idx] = min(max(boundaries[idx], lower_bound), upper_bound)
-            max_boundary = boundaries[idx] - min_step
+        last = matched[-1]
+        if last < len(gt_tokens) - 1:
+            last_end = float(token_times[last][1])
+            _fill_evenly(last + 1, len(gt_tokens) - 1, last_end, total_end)
 
         out_times: List[Tuple[float, float]] = []
+        prev_end = total_start
         for idx in range(len(gt_tokens)):
-            start_time = boundaries[idx]
-            end_time = boundaries[idx + 1]
-            if end_time <= start_time:
-                end_time = start_time + min_step
+            start_time, end_time = token_times[idx] if token_times[idx] is not None else (prev_end, prev_end + min_step)
+            start_time = max(float(start_time), prev_end)
+            end_time = max(float(end_time), start_time + min_step)
             out_times.append((round(start_time, 3), round(end_time, 3)))
+            prev_end = end_time
 
         return out_times
 
@@ -1416,12 +1557,107 @@ class Qwen3ASRModel:
             f"matched={matched_count} unmatched={unmatched_count}.",
         )
 
+    def _log_gt_sentence_mapping_debug(
+        self,
+        sample_idx: int,
+        reference_text: str,
+        language: str,
+        gt_tokens: List[Dict[str, str]],
+        asr_tokens: List[Dict[str, Any]],
+        mapping: List[Optional[int]],
+        token_times: List[Tuple[float, float]],
+    ) -> None:
+        sentences = self._split_text_into_alignment_sentences(reference_text, language)
+        if not sentences:
+            return
+
+        for sentence_idx, sentence in enumerate(sentences):
+            start = int(sentence["start"])
+            end = min(int(sentence["end"]), len(gt_tokens), len(token_times), len(mapping))
+            if start < 0 or end <= start:
+                continue
+
+            mapped_pairs = [
+                (gt_idx, int(mapping[gt_idx]))
+                for gt_idx in range(start, end)
+                if mapping[gt_idx] is not None
+            ]
+            mapped_asr_indices = [asr_idx for _, asr_idx in mapped_pairs]
+            sentence_start = float(token_times[start][0])
+            sentence_end = float(token_times[end - 1][1])
+
+            mapped_span = "none"
+            mapped_time = "n/a"
+            mapped_text = ""
+            max_asr_jump = 0
+            max_asr_gap = 0.0
+            span_width = 0
+
+            if mapped_asr_indices:
+                first_asr_idx = mapped_asr_indices[0]
+                last_asr_idx = mapped_asr_indices[-1]
+                span_width = last_asr_idx - first_asr_idx + 1
+                mapped_span = f"{first_asr_idx}:{last_asr_idx + 1}"
+                mapped_time = (
+                    f"{round(float(asr_tokens[first_asr_idx]['start_time']), 3)}-"
+                    f"{round(float(asr_tokens[last_asr_idx]['end_time']), 3)}"
+                )
+                mapped_text = "".join(
+                    str(asr_tokens[asr_idx]["text"] or "")
+                    for asr_idx in range(first_asr_idx, last_asr_idx + 1)
+                )
+                for left_asr_idx, right_asr_idx in zip(mapped_asr_indices, mapped_asr_indices[1:]):
+                    max_asr_jump = max(max_asr_jump, right_asr_idx - left_asr_idx)
+                    gap = float(asr_tokens[right_asr_idx]["start_time"]) - float(asr_tokens[left_asr_idx]["end_time"])
+                    max_asr_gap = max(max_asr_gap, gap)
+
+            token_count = end - start
+            self._log_ground_truth_alignment(
+                "info",
+                f"sample={sample_idx} gt_sentence_map={sentence_idx} gt_tokens={start}:{end} "
+                f"gt_time={round(sentence_start, 3)}-{round(sentence_end, 3)} "
+                f"mapped_asr={mapped_span} mapped_time={mapped_time} "
+                f"matched={len(mapped_pairs)}/{token_count} span_width={span_width} "
+                f"max_asr_jump={max_asr_jump} max_asr_gap={round(max_asr_gap, 3)} "
+                f"gt_text='{self._preview_text(sentence['text'], limit=64)}' "
+                f"asr_text='{self._preview_text(mapped_text, limit=64)}'.",
+            )
+
+            suspicious = (
+                max_asr_jump > 2
+                or max_asr_gap > 0.4
+                or (mapped_asr_indices and span_width > (len(mapped_pairs) + 2))
+            )
+            if not suspicious:
+                continue
+
+            for gt_idx in range(start, end):
+                interp_start, interp_end = token_times[gt_idx]
+                asr_idx = mapping[gt_idx]
+                if asr_idx is None:
+                    mapped_desc = "None"
+                else:
+                    asr_idx = int(asr_idx)
+                    mapped_desc = (
+                        f"{asr_idx}:{asr_tokens[asr_idx]['text']}@"
+                        f"{round(float(asr_tokens[asr_idx]['start_time']), 3)}-"
+                        f"{round(float(asr_tokens[asr_idx]['end_time']), 3)}"
+                    )
+                self._log_ground_truth_alignment(
+                    "info",
+                    f"sample={sample_idx} gt_sentence_map={sentence_idx} token={gt_idx} "
+                    f"gt='{self._preview_text(gt_tokens[gt_idx]['text'], limit=16)}' "
+                    f"interp={round(float(interp_start), 3)}-{round(float(interp_end), 3)} "
+                    f"mapped_asr={mapped_desc}.",
+                )
+
     def _align_reference_to_asr_timestamps(
         self,
         reference_text: str,
         language: str,
         asr_aligned_results: List[Any],
         sample_idx: int,
+        asr_text: Optional[str] = None,
     ) -> Tuple[Optional[Any], Optional[List[Optional[int]]]]:
         self._require_text_alignment_dependencies(language)
         merged_asr = self._merge_align_results(asr_aligned_results)
@@ -1431,9 +1667,24 @@ class Qwen3ASRModel:
         asr_items = list(merged_asr.items)
         gt_tokens = self._tokenize_ground_truth_with_original_text(reference_text, language)
         asr_tokens = self._normalize_timed_items_for_compare(asr_items, language)
+        asr_tokens = self._repair_asr_token_times_by_sentence(
+            asr_text=str(asr_text or ""),
+            language=language,
+            asr_tokens=asr_tokens,
+            sample_idx=sample_idx,
+        )
         mapping = self._global_align_token_sequences(gt_tokens, asr_tokens)
         self._log_token_alignment_debug(sample_idx, gt_tokens, asr_tokens, mapping)
         token_times = self._interpolate_ground_truth_token_times(gt_tokens, asr_tokens, mapping)
+        self._log_gt_sentence_mapping_debug(
+            sample_idx=sample_idx,
+            reference_text=reference_text,
+            language=language,
+            gt_tokens=gt_tokens,
+            asr_tokens=asr_tokens,
+            mapping=mapping,
+            token_times=token_times,
+        )
         result = self._build_result_from_token_times(gt_tokens, token_times, merged_asr)
         return (result, mapping)
 
