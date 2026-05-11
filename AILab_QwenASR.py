@@ -70,8 +70,8 @@ SUPPORTED_LANGUAGES = [
 
 _ASR_MODEL_CACHE = {}
 _CONFIG_CACHE = {"mtime": None, "data": None}
-_SUBTITLE_STRIP_CHARS = "，。！？、,.!?；;：:\"'“”‘’（）()【】[]《》〈〉「」『』…—- "
-_SUBTITLE_SPLIT_PUNCT = ("，", "。", "！", "？", "、", "；", "：", ",", ".", "!", "?", ";", ":", "…")
+_SUBTITLE_STRIP_CHARS = "，。！？、,.!?；;：:\"'“”‘’（）()【】[]《》〈〉「」『』…—-~ "
+_SUBTITLE_SPLIT_PUNCT = ("，", "。", "！", "？", "、", "；", "：", ",", ".", "!", "?", ";", ":", "…", "~")
 _SUBTITLE_POST_PUNCT_CHARS = "\"'“”‘’（）()【】[]《》〈〉「」『』 \t\r\n"
 _SUBTITLE_INLINE_REMOVE_CHARS = "“”‘’「」『』"
 
@@ -511,7 +511,7 @@ def _align_punctuation_to_stamps(full_text: str, time_stamps: list) -> list:
     if not time_stamps or not full_text:
         return time_stamps
 
-    punct_chars = set("，。！？、；：,.!?;:…“”‘’\"'")
+    punct_chars = set("，。！？、；：,.!?;:…~“”‘’\"'")
     aligned = []
     cursor = 0
 
@@ -690,6 +690,92 @@ def _group_time_stamps_with_spans(
 
     for g in groups:
         g["text"] = _clean_subtitle_text(g["text"])
+
+    return groups
+
+
+def _split_text_into_subtitle_spans(text: str, language: str, tokenize_text):
+    raw_text = str(text or "").strip()
+    if not raw_text or not callable(tokenize_text):
+        return []
+
+    terminators = set(_SUBTITLE_SPLIT_PUNCT)
+    terminators.add("\n")
+    parts = []
+    current = []
+    for ch in raw_text:
+        current.append(ch)
+        if ch in terminators:
+            part = "".join(current).strip()
+            if part:
+                parts.append(part)
+            current = []
+    if current:
+        part = "".join(current).strip()
+        if part:
+            parts.append(part)
+
+    spans = []
+    cursor = 0
+    for part in parts:
+        tokens = tokenize_text(part, language)
+        if not tokens:
+            continue
+        start = cursor
+        end = start + len(tokens)
+        spans.append(
+            {
+                "text": part,
+                "tokens": tokens,
+                "start": start,
+                "end": end,
+            }
+        )
+        cursor = end
+
+    return spans
+
+
+def _group_time_stamps_by_sentence_spans(time_stamps, sentence_spans):
+    if not time_stamps or not sentence_spans:
+        return []
+
+    items = list(time_stamps)
+    if not items:
+        return []
+
+    groups = []
+    item_count = len(items)
+    for sentence in sentence_spans:
+        start_idx = max(0, int(sentence.get("start", 0)))
+        end_idx = max(start_idx + 1, int(sentence.get("end", start_idx + 1)))
+        if start_idx >= item_count:
+            continue
+        end_idx = min(end_idx, item_count)
+        sentence_items = items[start_idx:end_idx]
+        if not sentence_items:
+            continue
+
+        text = ""
+        for item in sentence_items:
+            token = (item.text or "").strip()
+            if not token:
+                continue
+            text = _join_tokens(text, token).strip()
+
+        text = _clean_subtitle_text(text)
+        if not text:
+            continue
+
+        groups.append(
+            {
+                "start": float(sentence_items[0].start_time),
+                "end": float(sentence_items[-1].end_time),
+                "text": text,
+                "token_start": start_idx,
+                "token_end": end_idx,
+            }
+        )
 
     return groups
 
@@ -950,11 +1036,34 @@ def _run_subtitle_transcription(
         effective_max_chars = 0
 
     if gt_text:
-        groups = _group_time_stamps_with_spans(
-            time_stamps,
-            max_gap_sec=effective_max_gap_sec,
-            max_chars=effective_max_chars,
-            split_mode=effective_split_mode,
+        guide_language = (detected_lang or lang or "English").split(",")[0].strip() or "English"
+        guide_spans = _split_text_into_subtitle_spans(
+            gt_text,
+            guide_language,
+            getattr(model, "_tokenize_alignment_text", None),
+        )
+        if not guide_spans:
+            sentence_splitter = getattr(model, "_split_text_into_alignment_refine_segments", None)
+            guide_spans = (
+                sentence_splitter(gt_text, guide_language) if callable(sentence_splitter) else []
+            )
+        if not guide_spans:
+            sentence_splitter = getattr(model, "_split_text_into_alignment_sentences", None)
+            guide_spans = (
+                sentence_splitter(gt_text, guide_language) if callable(sentence_splitter) else []
+            )
+        groups = _group_time_stamps_by_sentence_spans(time_stamps, guide_spans)
+        if not groups:
+            groups = _group_time_stamps_with_spans(
+                time_stamps,
+                max_gap_sec=effective_max_gap_sec,
+                max_chars=effective_max_chars,
+                split_mode=effective_split_mode,
+            )
+        groups = _snap_groups_to_source_token_times(
+            groups,
+            getattr(result, "source_time_stamps", None),
+            getattr(result, "source_token_mapping", None),
         )
     else:
         groups = _group_time_stamps(

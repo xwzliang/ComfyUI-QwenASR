@@ -936,7 +936,7 @@ class Qwen3ASRModel:
         if not raw_text:
             return []
 
-        terminators = set("。！？!?；;…\n")
+        terminators = set("。！？!?；;…~\n")
         parts: List[str] = []
         current: List[str] = []
         for ch in raw_text:
@@ -979,7 +979,7 @@ class Qwen3ASRModel:
         if not raw_text:
             return []
 
-        terminators = set("。！？!?；;…，,：:\n")
+        terminators = set("。！？!?；;…~，,：:\n")
         parts: List[str] = []
         current: List[str] = []
         for ch in raw_text:
@@ -1137,7 +1137,7 @@ class Qwen3ASRModel:
         if not items:
             return []
 
-        terminators = set("。！？!?；;…")
+        terminators = set("。！？!?；;…~")
         grouped: List[Tuple[float, float, str]] = []
         current_text: List[str] = []
         current_start: Optional[float] = None
