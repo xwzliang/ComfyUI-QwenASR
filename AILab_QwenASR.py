@@ -5,6 +5,7 @@
 # This integration script follows GPL-3.0 License.
 
 import os
+import re
 import shutil
 import sys
 import time
@@ -70,10 +71,45 @@ SUPPORTED_LANGUAGES = [
 
 _ASR_MODEL_CACHE = {}
 _CONFIG_CACHE = {"mtime": None, "data": None}
-_SUBTITLE_STRIP_CHARS = "，。！？、,.!?；;：:\"'“”‘’（）()【】[]《》〈〉「」『』…—-~ "
 _SUBTITLE_SPLIT_PUNCT = ("，", "。", "！", "？", "、", "；", "：", ",", ".", "!", "?", ";", ":", "…", "~")
 _SUBTITLE_POST_PUNCT_CHARS = "\"'“”‘’（）()【】[]《》〈〉「」『』 \t\r\n"
 _SUBTITLE_INLINE_REMOVE_CHARS = "“”‘’「」『』"
+_SUBTITLE_EDGE_STRIP_CHARS = "\"'“”‘’（）()【】[]《》〈〉「」『』—-~ \t\r\n"
+_SUBTITLE_PUNCT_CHARS = "，。！？、；：,.!?;:…~"
+_SUBTITLE_PUNCT_RUN_RE = re.compile(rf"[{re.escape(_SUBTITLE_PUNCT_CHARS)}]+")
+_SUBTITLE_SPACE_RE = re.compile(r"[ \t\r\f\v]+")
+_ENGLISH_CONTRACTION_REPLACEMENTS = (
+    (re.compile(r"\b[Dd]ont\b"), "don't"),
+    (re.compile(r"\b[Cc]ant\b"), "can't"),
+    (re.compile(r"\b[Ww]ont\b"), "won't"),
+    (re.compile(r"\b[Ii]m\b"), "I'm"),
+    (re.compile(r"\b[Ii]ts\b"), "it's"),
+    (re.compile(r"\b[Tt]hats\b"), "that's"),
+    (re.compile(r"\b[Tt]heres\b"), "there's"),
+)
+_LOW_CONFIDENCE_SINGLE_PUNCT_AFTER = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "but",
+    "for",
+    "from",
+    "in",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "then",
+    "this",
+    "to",
+    "when",
+    "with",
+}
 
 
 def _default_config():
@@ -465,7 +501,7 @@ def _build_srt(time_stamps) -> str:
         lines.append(
             f"{_format_srt_time(item.start_time)} --> {_format_srt_time(item.end_time)}"
         )
-        lines.append(item.text or "")
+        lines.append(_clean_subtitle_text(item.text or ""))
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -482,19 +518,114 @@ def _join_tokens(a: str, b: str) -> str:
     return f"{a} {b}"
 
 
+def _char_before(text: str, index: int) -> str:
+    for pos in range(index - 1, -1, -1):
+        if not text[pos].isspace():
+            return text[pos]
+    return ""
+
+
+def _char_after(text: str, index: int) -> str:
+    for pos in range(index, len(text)):
+        if not text[pos].isspace():
+            return text[pos]
+    return ""
+
+
+def _word_before(text: str, index: int) -> str:
+    left = text[:index].rstrip()
+    match = re.search(r"([A-Za-z]+)$", left)
+    return match.group(1).lower() if match else ""
+
+
+def _is_word_char(ch: str) -> bool:
+    return bool(ch) and (ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+
+
+def _normalize_punctuation_run(match: re.Match) -> str:
+    run = match.group(0)
+    start, end = match.span()
+    source = match.string
+    before = _char_before(source, start)
+    after = _char_after(source, end)
+    between_words = _is_word_char(before) and _is_word_char(after)
+
+    if len(run) == 1:
+        if between_words and _word_before(source, start) in _LOW_CONFIDENCE_SINGLE_PUNCT_AFTER:
+            return " "
+        return run
+
+    # Long or mixed punctuation runs are usually ASR hallucinations in English
+    # subtitles. Between words, dropping them reads better than inventing stops.
+    if between_words:
+        return " "
+
+    if any(ch in run for ch in ("?", "？")):
+        return "？" if "？" in run and "?" not in run else "?"
+    if any(ch in run for ch in ("!", "！")):
+        return "！" if "！" in run and "!" not in run else "!"
+    if any(ch in run for ch in ("。", ".", "…")):
+        return "。" if "。" in run and "." not in run else "."
+    if any(ch in run for ch in ("，", ",", "、")):
+        if "，" in run and "," not in run:
+            return "，"
+        if "、" in run and "," not in run and "，" not in run:
+            return "、"
+        return ","
+    if any(ch in run for ch in ("；", ";")):
+        return "；" if "；" in run and ";" not in run else ";"
+    if any(ch in run for ch in ("：", ":")):
+        return "：" if "：" in run and ":" not in run else ":"
+    return ""
+
+
+def _restore_common_english_contractions(text: str) -> str:
+    restored = text
+    for pattern, replacement in _ENGLISH_CONTRACTION_REPLACEMENTS:
+        restored = pattern.sub(
+            lambda match, value=replacement: (
+                value[:1].upper() + value[1:]
+                if match.group(0)[:1].isupper()
+                else value
+            ),
+            restored,
+        )
+    return restored
+
+
+def _strip_subtitle_terminal_punct(text: str) -> str:
+    stripped = str(text or "").rstrip(_SUBTITLE_EDGE_STRIP_CHARS)
+    stripped = stripped.rstrip(_SUBTITLE_PUNCT_CHARS)
+    return stripped.rstrip(_SUBTITLE_EDGE_STRIP_CHARS)
+
+
+def _normalize_subtitle_text(text: str, strip_terminal: bool = True) -> str:
+    normalized = str(text or "")
+    for ch in _SUBTITLE_INLINE_REMOVE_CHARS:
+        normalized = normalized.replace(ch, "")
+    normalized = normalized.replace("…", "...")
+    normalized = _SUBTITLE_PUNCT_RUN_RE.sub(_normalize_punctuation_run, normalized)
+    normalized = re.sub(r"\s+([，。！？、；：,.!?;:])", r"\1", normalized)
+    normalized = re.sub(r"([，。！？、；：,.!?;:])(?=[A-Za-z0-9])", r"\1 ", normalized)
+    normalized = _SUBTITLE_SPACE_RE.sub(" ", normalized)
+    normalized = normalized.strip(_SUBTITLE_EDGE_STRIP_CHARS)
+    normalized = _restore_common_english_contractions(normalized)
+    normalized = _SUBTITLE_SPACE_RE.sub(" ", normalized)
+    if strip_terminal:
+        normalized = _strip_subtitle_terminal_punct(normalized)
+    return normalized.strip(_SUBTITLE_EDGE_STRIP_CHARS)
+
+
 def _ends_with_split_punct(text: str) -> bool:
     if not text:
         return False
     return text.rstrip(_SUBTITLE_POST_PUNCT_CHARS).endswith(_SUBTITLE_SPLIT_PUNCT)
 
 
-def _clean_subtitle_text(text: str) -> str:
+def _clean_subtitle_text(text: str, strip_terminal: bool = True) -> str:
     if not text:
         return ""
-    cleaned = str(text)
-    for ch in _SUBTITLE_INLINE_REMOVE_CHARS:
-        cleaned = cleaned.replace(ch, "")
-    return cleaned.strip(_SUBTITLE_STRIP_CHARS)
+    return _normalize_subtitle_text(text, strip_terminal=strip_terminal)
 
 
 class _AlignedStamp:
@@ -516,7 +647,7 @@ def _align_punctuation_to_stamps(full_text: str, time_stamps: list) -> list:
     cursor = 0
 
     for i, stamp in enumerate(time_stamps):
-        word = (stamp.text or "").strip()
+        word = _clean_subtitle_text(stamp.text or "")
         start_time = stamp.start_time
         end_time = stamp.end_time
 
@@ -531,7 +662,7 @@ def _align_punctuation_to_stamps(full_text: str, time_stamps: list) -> list:
             # Find bounds for the gap between this word and the next
             next_idx = len(full_text)
             if i + 1 < len(time_stamps):
-                next_word = (time_stamps[i + 1].text or "").strip()
+                next_word = _clean_subtitle_text(time_stamps[i + 1].text or "")
                 if next_word:
                     temp_idx = full_text.find(next_word, cursor)
                     if temp_idx != -1:
@@ -557,7 +688,7 @@ def _group_time_stamps(
     groups = []
     cur = None
     for item in time_stamps:
-        text = (item.text or "").strip()
+        text = _clean_subtitle_text(item.text or "", strip_terminal=False)
         if not text:
             continue
         if cur is None:
@@ -627,7 +758,7 @@ def _group_time_stamps_with_spans(
     groups = []
     cur = None
     for idx, item in enumerate(time_stamps):
-        text = (item.text or "").strip()
+        text = _clean_subtitle_text(item.text or "", strip_terminal=False)
         if not text:
             continue
         if cur is None:
@@ -758,7 +889,7 @@ def _group_time_stamps_by_sentence_spans(time_stamps, sentence_spans):
 
         text = ""
         for item in sentence_items:
-            token = (item.text or "").strip()
+            token = _clean_subtitle_text(item.text or "", strip_terminal=False)
             if not token:
                 continue
             text = _join_tokens(text, token).strip()
@@ -923,7 +1054,7 @@ def _group_time_stamps_by_guide_mapping(
             continue
         text = ""
         for item in items:
-            token = (item.text or "").strip()
+            token = _clean_subtitle_text(item.text or "", strip_terminal=False)
             if not token:
                 continue
             text = _join_tokens(text, token).strip()
@@ -1017,7 +1148,7 @@ def _run_subtitle_transcription(
         )
 
     result = results[0]
-    text = result.text or ""
+    text = _clean_subtitle_text(result.text or "")
     detected_lang = result.language or ""
     file_content = ""
     file_path = ""
@@ -1232,7 +1363,7 @@ class AILab_Qwen3ASR:
         )
 
         result = results[0]
-        text = result.text or ""
+        text = _clean_subtitle_text(result.text or "")
 
         if unload_models:
             _ASR_MODEL_CACHE.clear()
