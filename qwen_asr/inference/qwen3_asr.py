@@ -1499,18 +1499,11 @@ class Qwen3ASRModel:
                             )
                             continue
 
-                    suffix_start_idx = start + prefix_count
-                    for token_idx in range(suffix_start_idx, end):
-                        new_start = float(repaired[token_idx]["start_time"]) - shift
-                        new_end = float(repaired[token_idx]["end_time"]) - shift
-                        repaired[token_idx]["start_time"] = round(new_start, 3)
-                        repaired[token_idx]["end_time"] = round(max(new_end, new_start + 0.001), 3)
-
                     self._log_ground_truth_alignment(
                         "info",
-                        f"sample={sample_idx} asr_sentence_repair={sentence_idx} type=middle_gap_suffix "
+                        f"sample={sample_idx} asr_sentence_repair={sentence_idx} type=middle_gap_skip_suffix "
                         f"token_span={start}:{end} split_at={start + max_rel_idx} gap={round(max_gap, 3)} "
-                        f"threshold={round(large_gap_threshold, 3)} shift={round(shift, 3)} "
+                        f"threshold={round(large_gap_threshold, 3)} proposed_shift={round(shift, 3)} "
                         f"target_gap={round(target_gap, 3)} "
                         f"text='{self._preview_text(sentence['text'], limit=64)}'.",
                     )

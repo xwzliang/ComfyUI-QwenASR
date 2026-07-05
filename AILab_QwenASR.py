@@ -963,6 +963,40 @@ def _snap_groups_to_source_token_times(groups, source_time_stamps, source_token_
     return snapped
 
 
+def _enforce_minimum_group_duration(groups, minimum_duration: float):
+    if not groups or minimum_duration <= 0:
+        return groups
+
+    adjusted = []
+    count = len(groups)
+    for idx, group in enumerate(groups):
+        start = float(group["start"])
+        end = float(group["end"])
+        if end - start < minimum_duration:
+            next_start = (
+                float(groups[idx + 1]["start"])
+                if idx + 1 < count
+                else float("inf")
+            )
+            desired_end = start + float(minimum_duration)
+            if desired_end <= next_start:
+                end = desired_end
+            elif next_start > start:
+                end = next_start
+            else:
+                end = max(end, start + 0.001)
+
+        adjusted.append(
+            {
+                **group,
+                "start": start,
+                "end": end,
+            }
+        )
+
+    return adjusted
+
+
 def _group_time_stamps_by_guide_mapping(
     time_stamps,
     guide_groups,
@@ -1204,7 +1238,9 @@ def _run_subtitle_transcription(
             split_mode=effective_split_mode,
         )
 
-    if minimum_duration > 0:
+    if minimum_duration > 0 and gt_text:
+        groups = _enforce_minimum_group_duration(groups, float(minimum_duration))
+    elif minimum_duration > 0:
         groups = [g for g in groups if (g["end"] - g["start"]) >= minimum_duration]
 
     lines = []
